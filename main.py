@@ -11,7 +11,6 @@ from cachetools import TTLCache
 
 app = FastAPI()
 
-# 允許跨域
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,21 +19,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 伺服器端快取：確保短時間內所有人查到的分數完全一樣
-cache = TTLCache(maxsize=200, ttl=1800) # 30分鐘快取
+# 快取：1小時內同一支股票，保證回傳完全一樣的 JSON
+cache = TTLCache(maxsize=200, ttl=3600)
 
 class StockRequest(BaseModel):
     ticker: str
     principal: int = 100000
     risk: str = "neutral"
 
-# --- 1. [權威運算] 伺服器端技術指標 ---
-# 這裡算出來的數字是最終標準，前端不准重算
-def calculate_server_technicals(df):
-    # 確保資料足夠，否則不計算
-    if len(df) < 120: 
-        return None
-    
+# --- 1. 精準技術指標 (Pandas) ---
+def calculate_technicals(df):
+    if len(df) < 30: return None
     close = df['Close']
     
     # RSI (14)
@@ -43,164 +38,155 @@ def calculate_server_technicals(df):
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
-    current_rsi = rsi.iloc[-1]
-
-    # MA (5, 20, 60)
-    ma5 = close.rolling(window=5).mean().iloc[-1]
-    ma20 = close.rolling(window=20).mean().iloc[-1]
-    ma60 = close.rolling(window=60).mean().iloc[-1]
 
     # MACD
     exp12 = close.ewm(span=12, adjust=False).mean()
     exp26 = close.ewm(span=26, adjust=False).mean()
     macd = exp12 - exp26
     signal = macd.ewm(span=9, adjust=False).mean()
-    macd_val = macd.iloc[-1]
 
-    # KD (9, 3, 3) - 簡易版
+    # Bollinger Bands
+    sma20 = close.rolling(window=20).mean()
+    std20 = close.rolling(window=20).std()
+    upper = sma20 + (std20 * 2)
+    lower = sma20 - (std20 * 2)
+
+    # KD (簡易)
     low_min = df['Low'].rolling(window=9).min()
     high_max = df['High'].rolling(window=9).max()
     rsv = ((close - low_min) / (high_max - low_min)) * 100
-    k = rsv.ewm(com=2).mean().iloc[-1]
-    d = k.ewm(com=2).mean().iloc[-1]
-
-    # 布林通道
-    std20 = close.rolling(window=20).std().iloc[-1]
-    upper = ma20 + (std20 * 2)
-    lower = ma20 - (std20 * 2)
-
-    # --- [評分邏輯] 伺服器端統一標準 ---
-    score = 50
+    k = rsv.ewm(com=2).mean()
     
-    # RSI 評分
-    if current_rsi > 70: score += 15 # 強勢
-    elif current_rsi < 30: score -= 10 # 弱勢
-    else: score += (current_rsi - 50) * 0.5
+    # MA
+    ma5 = close.rolling(window=5).mean()
+    ma20 = sma20
+    ma60 = close.rolling(window=60).mean()
 
-    # 均線評分 (多頭排列)
-    price = close.iloc[-1]
-    if price > ma5 > ma20 > ma60: score += 15
-    elif price < ma5 < ma20 < ma60: score -= 15
-    elif price > ma20: score += 5
-
-    # MACD 評分
-    if macd_val > 0: score += 5
+    def safe(series):
+        val = series.iloc[-1]
+        return float(val) if not np.isnan(val) else 0.0
 
     return {
-        "score": min(99, max(1, int(score))),
-        "indicators": {
-            "rsi": round(float(current_rsi), 2),
-            "ma20": round(float(ma20), 2),
-            "macd": round(float(macd_val), 2),
-            "k": round(float(k), 2),
-            "upper": round(float(upper), 2),
-            "lower": round(float(lower), 2)
-        }
+        "rsi": safe(rsi),
+        "macd": safe(macd),
+        "upper": safe(upper),
+        "lower": safe(lower),
+        "k": safe(k),
+        "ma5": safe(ma5),
+        "ma20": safe(ma20),
+        "ma60": safe(ma60),
+        "price": safe(close)
     }
 
-# --- 2. [權威數據] 證交所/Yahoo ---
-def get_fundamentals_score(info):
-    score = 50
-    try:
-        if info.get('trailingEps', 0) > 0: score += 10
-        if info.get('returnOnEquity', 0) > 0.1: score += 10
-        if 0 < info.get('trailingPE', 0) < 25: score += 10
-    except: pass
-    return score
-
-def get_chip_score(stock_code):
-    # 台股籌碼邏輯 (簡化版，確保穩定回傳)
-    # 這裡如果爬蟲失敗，會回傳 50 分中性，保證不報錯
-    if not (stock_code.isdigit() and len(stock_code) == 4): return 50
+# --- 2. 籌碼面 (台股) ---
+def get_twse_chip(stock_code):
+    if not (stock_code.isdigit() and len(stock_code) == 4): return 0
     try:
         url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
         res = requests.get(url, timeout=3)
         if res.status_code == 200:
             data = res.json()
-            for row in data.get('data', []):
-                if row[0] == stock_code:
-                    val = float(row[-1].replace(',', ''))
-                    if val > 1000: return 80
-                    if val < -1000: return 30
-                    return 60
-    except: pass
-    return 50
+            if 'data' in data:
+                for row in data['data']:
+                    if row[0] == stock_code:
+                        return int(row[-1].replace(',', ''))
+    except:
+        pass
+    return 0
+
+# --- 3. 基本面 ---
+def get_fundamentals(info):
+    score = 50
+    try:
+        if info.get('trailingEps', 0) > 0: score += 15
+        if info.get('returnOnEquity', 0) > 0.1: score += 15
+        if 0 < info.get('trailingPE', 0) < 25: score += 10
+        if info.get('profitMargins', 0) > 0.15: score += 10
+    except:
+        pass
+    return min(99, max(1, score))
 
 @app.post("/analyze")
 def analyze(req: StockRequest):
     ticker = req.ticker.upper()
-    
-    if ticker in cache:
-        return cache[ticker]
+    if ticker in cache: return cache[ticker]
 
     try:
         stock = yf.Ticker(ticker)
-        # 強制抓取 1 年數據，確保技術指標運算基底一致
-        hist = stock.history(period="1y")
-        
-        if hist.empty:
-            raise HTTPException(status_code=404, detail="查無資料")
+        hist = stock.history(period="6mo")
+        if hist.empty: raise HTTPException(status_code=404, detail="No Data")
 
-        # 1. 計算技術面 (Technical) - 40%
-        tech_result = calculate_server_technicals(hist)
-        tech_score = tech_result['score'] if tech_result else 50
-        
-        # 2. 計算基本面 (Fundamental) - 30%
-        fund_score = get_fundamentals_score(stock.info)
-        
-        # 3. 計算籌碼面 (Chip) - 15%
-        chip_score = 50
+        # A. 計算技術指標與分數
+        tech = calculate_technicals(hist)
+        tech_score = 50
+        if tech:
+            if tech['rsi'] > 70: tech_score = 85
+            elif tech['rsi'] < 30: tech_score = 25
+            else: tech_score = 50 + (tech['rsi'] - 50) * 0.5
+            
+            if tech['price'] > tech['ma20']: tech_score += 10
+            if tech['ma5'] > tech['ma20']: tech_score += 10
+            tech_score = min(99, max(1, int(tech_score)))
+
+        # B. 計算基本面
+        fund_score = get_fundamentals(stock.info)
+
+        # C. 計算籌碼面
+        chip_val = 0
         if ".TW" in ticker:
-            chip_score = get_chip_score(ticker.split('.')[0])
+            chip_val = get_twse_chip(ticker.split('.')[0])
         
-        # 4. 消息面 (News) - 15%
-        news_score = 50 # 暫時中性
+        chip_score = 50
+        if chip_val > 1000000: chip_score = 90
+        elif chip_val > 0: chip_score = 65
+        elif chip_val < -1000000: chip_score = 20
+        elif chip_val < 0: chip_score = 40
 
-        # 5. [最終總分] 伺服器蓋章認證
-        total_score = int(tech_score * 0.4 + fund_score * 0.3 + chip_score * 0.15 + news_score * 0.15)
+        # D. 消息面 (暫時中性)
+        news_score = 50
 
-        # 準備圖表數據
-        chart_dates = hist.index.strftime('%Y-%m-%d').tolist()
-        chart_prices = hist['Close'].tolist()
+        # E. 總分 (由後端一錘定音)
+        total_score = int(tech_score * 0.4 + fund_score * 0.2 + chip_score * 0.2 + news_score * 0.2)
+
+        # 回傳完整資料 (包含圖表)
+        dates = hist.index.strftime('%Y-%m-%d').tolist()
+        prices = hist['Close'].tolist()
         
-        # 簡單預測
-        future_dates = []
-        future_means = []
-        last_price = chart_prices[-1]
-        last_date = datetime.datetime.strptime(chart_dates[-1], '%Y-%m-%d')
-        trend = 1.002 if tech_score > 60 else 0.998
-        for i in range(1, 6):
-            future_dates.append((last_date + datetime.timedelta(days=i)).strftime('%Y-%m-%d'))
-            future_means.append(round(last_price * (trend ** i), 2))
+        # 預測線
+        last_p = prices[-1]
+        trend = 1.005 if tech and tech['ma5'] > tech['ma20'] else 0.995
+        f_dates = [(datetime.datetime.strptime(dates[-1], '%Y-%m-%d') + datetime.timedelta(days=i)).strftime('%Y-%m-%d') for i in range(1,6)]
+        f_means = [round(last_p * (trend ** i), 2) for i in range(1,6)]
 
-        response = {
+        result = {
             "ticker": ticker,
-            "current_price": round(last_price, 2),
+            "current_price": round(last_p, 2),
             "total_score": total_score,  # 這是唯一的真理分數
-            "evaluation": "強勢多頭" if total_score > 75 else ("區間整理" if total_score > 60 else "弱勢"),
-            "recommendation": "買進" if total_score > 70 else "觀望",
-            "details": {
+            "evaluation": "多頭" if total_score > 60 else "空頭",
+            "scores": {
                 "tech": tech_score,
                 "fund": fund_score,
                 "chip": chip_score,
                 "news": news_score
             },
-            # 附上伺服器算好的精確指標，前端直接顯示即可
-            "tech_indicators": tech_result['indicators'] if tech_result else {},
+            "tech_details": tech, # 用於前端顯示詳細數字，但不參與前端運算
             "chart_data": {
-                "history_date": chart_dates,
-                "history_price": [round(p, 2) for p in chart_prices],
-                "future_date": future_dates,
-                "future_mean": future_means
+                "history_date": dates,
+                "history_price": [round(p, 2) for p in prices],
+                "future_date": f_dates,
+                "future_mean": f_means,
+                # 為節省頻寬，只傳必要數據
+                "future_upper": [round(p*1.05, 2) for p in f_means],
+                "future_lower": [round(p*0.95, 2) for p in f_means]
             }
         }
         
-        cache[ticker] = response
-        return response
+        cache[ticker] = result
+        return result
 
     except Exception as e:
         print(e)
-        raise HTTPException(status_code=500, detail="分析失敗")
+        raise HTTPException(status_code=500, detail="Error")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
