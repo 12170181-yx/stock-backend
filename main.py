@@ -1,5 +1,6 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yfinance as yf
@@ -7,11 +8,15 @@ import pandas as pd
 import numpy as np
 import requests
 import datetime
+from typing import List, Optional
 from cachetools import TTLCache
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import uuid
 
-app = FastAPI()
+app = FastAPI(title="AI Stock Analysis API - SRS Ultimate")
 
-# 允許跨域請求 (讓前端可以連線)
+# --- CORS 設定 (允許前端連線) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,56 +25,104 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 設定快取：個股分析 30 分鐘，排行榜 1 小時
-cache = TTLCache(maxsize=200, ttl=1800)
-rank_cache = TTLCache(maxsize=1, ttl=3600)
+# --- 模擬資料庫 (In-Memory) ---
+# 注意：這是為了 Demo 方便，重啟後資料會清空
+users_db = {} 
+portfolio_db = {} # {username: [positions]}
+favorites_db = {} # {username: [tickers]}
 
-class StockRequest(BaseModel):
-    ticker: str
+# --- Auth 設定 (JWT) ---
+SECRET_KEY = "srs-super-secret-key-demo"
+ALGORITHM = "HS256"
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
+# --- 快取設定 ---
+cache = TTLCache(maxsize=200, ttl=1800) # 個股分析快取 30 分鐘
+rank_cache = TTLCache(maxsize=1, ttl=3600) # 排行榜快取 1 小時
+
+# --- 資料模型 ---
+class User(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class PortfolioItem(BaseModel):
+    symbol: str
+    cost_price: float
+    shares: int
+    date: str
+
+class AnalyzeRequest(BaseModel):
+    symbol: str
     principal: int = 100000
     risk: str = "neutral"
 
-# --- 1. 精準技術指標運算 (Pandas/Numpy) ---
-# 這是您的核心運算引擎，確保數據準確
+# --- Auth Helper Functions ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="無效憑證")
+        return username
+    except JWTError:
+        raise HTTPException(status_code=401, detail="憑證過期")
+
+# --- 1. 真實數據運算核心 (SRS Requirement) ---
+
 def calculate_technicals(df):
+    """計算 RSI, MACD, BB, KD, MA"""
     if len(df) < 60: return None
-    
     close = df['Close']
     high = df['High']
     low = df['Low']
 
     # RSI (14)
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
 
-    # MACD (12, 26, 9)
+    # MACD
     exp12 = close.ewm(span=12, adjust=False).mean()
     exp26 = close.ewm(span=26, adjust=False).mean()
     macd = exp12 - exp26
     signal = macd.ewm(span=9, adjust=False).mean()
 
-    # Bollinger Bands (20, 2)
-    sma20 = close.rolling(window=20).mean()
-    std20 = close.rolling(window=20).std()
+    # Bollinger Bands
+    sma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
     upper = sma20 + (std20 * 2)
     lower = sma20 - (std20 * 2)
 
-    # KD (簡易運算)
-    low_min = low.rolling(window=9).min()
-    high_max = high.rolling(window=9).max()
+    # KD (簡易)
+    low_min = low.rolling(9).min()
+    high_max = high.rolling(9).max()
     rsv = ((close - low_min) / (high_max - low_min)) * 100
-    k = rsv.ewm(com=2).mean() # 近似計算
+    k = rsv.ewm(com=2).mean()
     d = k.ewm(com=2).mean()
 
-    # MA 均線
-    ma5 = close.rolling(window=5).mean()
+    # MA
+    ma5 = close.rolling(5).mean()
     ma20 = sma20
-    ma60 = close.rolling(window=60).mean()
+    ma60 = close.rolling(60).mean()
 
-    # 安全數值轉換 (處理 NaN)
     def safe(series):
         val = series.iloc[-1]
         return float(val) if not np.isnan(val) else 0.0
@@ -87,216 +140,251 @@ def calculate_technicals(df):
         "price": safe(close)
     }
 
-# --- 2. 籌碼面 (台股證交所爬蟲) ---
-# 針對 .TW 結尾的股票抓取真實法人買賣超
 def get_twse_chip(stock_code):
+    """爬取證交所真實籌碼 (針對台股)"""
     if not (stock_code.isdigit() and len(stock_code) == 4): return 0
     try:
-        # 抓取證交所最新的三大法人買賣超日報
         url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
-        res = requests.get(url, timeout=4)
+        # 設定 User-Agent 避免被擋
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=4)
         if res.status_code == 200:
             data = res.json()
             if 'data' in data:
                 for row in data['data']:
                     if row[0] == stock_code:
-                        # 回傳三大法人合計買賣超股數 (處理千分位逗點)
+                        # 回傳三大法人合計買賣超股數
                         return int(row[-1].replace(',', ''))
     except:
         pass
     return 0
 
-# --- 3. 基本面 (Yahoo Info) ---
-def get_fundamentals(info):
-    score = 50
-    try:
-        # 根據 EPS, ROE, PE 給予評分
-        if info.get('trailingEps', 0) > 0: score += 15
-        if info.get('returnOnEquity', 0) > 0.1: score += 15
-        
-        pe = info.get('trailingPE', 0)
-        if 0 < pe < 25: score += 10
-        elif pe > 50: score -= 10 # 本益比過高扣分
-        
-        if info.get('profitMargins', 0) > 0.15: score += 10
-    except:
-        pass
-    return min(99, max(1, score))
-
-# --- 4. 真實新聞抓取 (New!) ---
 def get_real_news(stock):
+    """抓取 Yahoo 真實新聞"""
     try:
         news = stock.news
         result = []
-        # 只取最新的 5 則新聞，並整理格式
-        for n in news[:5]: 
+        for n in news[:5]:
             result.append({
                 "title": n.get('title', '無標題'),
                 "link": n.get('link', '#'),
-                "publisher": n.get('publisher', 'Yahoo Finance'),
-                "time": "Latest"
+                "publisher": n.get('publisher', 'Yahoo')
             })
         return result
     except:
         return []
 
-# --- 5. 排行榜快速掃描 (New!) ---
-def quick_scan(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        # 只抓一個月數據做快速掃描
-        hist = stock.history(period="1mo")
-        if hist.empty: return None
-        
-        price = hist['Close'].iloc[-1]
-        prev = hist['Close'].iloc[0]
-        change = (price - prev) / prev
-        
-        # 簡單趨勢評分
-        ma5 = hist['Close'].rolling(5).mean().iloc[-1]
-        score = 60
-        if price > ma5: score += 10
-        if change > 0.05: score += 10
-        elif change < -0.05: score -= 10
-        
-        return {
-            "ticker": ticker,
-            "price": round(price, 2),
-            "change_pct": round(change * 100, 2),
-            "score": min(99, max(1, score))
-        }
-    except:
-        return None
+def calculate_var(returns, confidence_level=0.05):
+    """計算 95% VaR (SRS #8 - 極端風險預警)"""
+    if len(returns) < 1: return 0
+    return returns.quantile(confidence_level)
 
-# --- API 接口定義 ---
+def detect_patterns(df):
+    """K線型態辨識 (SRS #15)"""
+    patterns = []
+    if len(df) < 5: return patterns
+    last = df.iloc[-1]
+    body = abs(last['Close'] - last['Open'])
+    upper = last['High'] - max(last['Close'], last['Open'])
+    lower = min(last['Close'], last['Open']) - last['Low']
+    
+    # 錘子線
+    if lower > body * 2 and upper < body * 0.5: patterns.append("錘子線")
+    # 長紅 K
+    if last['Close'] > last['Open'] and body > (last['High'] - last['Low']) * 0.8: patterns.append("長紅 K")
+    # 均線黃金交叉
+    ma5 = df['Close'].rolling(5).mean()
+    ma20 = df['Close'].rolling(20).mean()
+    if ma5.iloc[-1] > ma20.iloc[-1] and ma5.iloc[-2] <= ma20.iloc[-2]: patterns.append("均線黃金交叉")
+    
+    return patterns
+
+# --- API Endpoints ---
 
 @app.get("/")
 def home():
-    return {"status": "ok", "version": "Integrated_Pro_v3"}
+    return {"status": "SRS_Backend_Ready"}
 
-# 取得熱門股排行
-@app.get("/rankings")
-def get_rankings():
-    # 檢查快取
-    if "global_rank" in rank_cache:
-        return rank_cache["global_rank"]
-    
-    # 預設掃描的熱門股清單 (含台股與美股)
-    targets = ["2330.TW", "2317.TW", "2454.TW", "2603.TW", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "GOOG"]
-    results = []
-    
-    for t in targets:
-        res = quick_scan(t)
-        if res: results.append(res)
-    
-    # 依分數高低排序
-    results.sort(key=lambda x: x['score'], reverse=True)
-    rank_cache["global_rank"] = results
-    return results
+# 1. 會員系統 (SRS #13)
+@app.post("/auth/register")
+def register(user: User):
+    if user.username in users_db:
+        raise HTTPException(status_code=400, detail="User exists")
+    users_db[user.username] = get_password_hash(user.password)
+    portfolio_db[user.username] = []
+    favorites_db[user.username] = []
+    return {"message": "Success"}
 
-# 個股深度分析
-@app.post("/analyze")
-def analyze(req: StockRequest):
-    ticker = req.ticker.upper()
-    
-    # 檢查快取
-    if ticker in cache:
-        return cache[ticker]
+@app.post("/auth/login", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    pwd = users_db.get(form_data.username)
+    if not pwd or not verify_password(form_data.password, pwd):
+        raise HTTPException(status_code=401, detail="Auth Failed")
+    token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": token, "token_type": "bearer"}
 
+# 2. 深度分析 (SRS 核心 - 需登入)
+@app.post("/api/analyze")
+def analyze(req: AnalyzeRequest, user: str = Depends(get_current_user)):
+    ticker = req.symbol.upper()
+    
+    # 在這裡不使用 Cache，確保 User 每次都能看到即時運算
     try:
         stock = yf.Ticker(ticker)
-        # 抓取 1 年數據以確保長天期均線 (MA60) 能計算
-        hist = stock.history(period="1y")
-        
-        if hist.empty:
-            raise HTTPException(status_code=404, detail="No Data")
+        hist = stock.history(period="1y") # 抓一年以計算長天期均線
+        if hist.empty: raise HTTPException(status_code=404, detail="No Data")
 
-        # A. 計算技術指標
+        # --- A. 運算各項指標 ---
         tech_data = calculate_technicals(hist)
-        tech_score = 50
-        if tech_data:
-            # 根據 RSI 判斷
-            if tech_data['rsi'] > 70: tech_score = 85
-            elif tech_data['rsi'] < 30: tech_score = 25
-            else: tech_score = 50 + (tech_data['rsi'] - 50) * 0.5
-            
-            # 根據均線判斷
-            if tech_data['price'] > tech_data['ma20']: tech_score += 10
-            if tech_data['ma5'] > tech_data['ma20']: tech_score += 10
-            
-            tech_score = min(99, max(1, int(tech_score)))
+        
+        # 基本面 (Yahoo Info)
+        info = stock.info
+        fund_score = 50
+        if info.get('trailingEps', 0) > 0: fund_score += 20
+        if info.get('returnOnEquity', 0) > 0.1: fund_score += 20
+        pe = info.get('trailingPE', 0)
+        if 0 < pe < 25: fund_score += 10
+        fund_score = min(99, max(1, fund_score))
 
-        # B. 計算基本面
-        fund_score = get_fundamentals(stock.info)
-
-        # C. 計算籌碼面 (台股專用)
+        # 籌碼面 (真實爬蟲)
         chip_val = 0
         if ".TW" in ticker:
             chip_val = get_twse_chip(ticker.split('.')[0])
-        
         chip_score = 50
         if chip_val > 1000000: chip_score = 85
         elif chip_val > 0: chip_score = 60
         elif chip_val < -1000000: chip_score = 25
         elif chip_val < 0: chip_score = 40
 
-        # D. 抓取真實新聞
+        # 技術面評分
+        tech_score = 50
+        if tech_data:
+            if tech_data['rsi'] > 70: tech_score = 85
+            elif tech_data['rsi'] < 30: tech_score = 25
+            if tech_data['price'] > tech_data['ma20']: tech_score += 10
+            if tech_data['ma5'] > tech_data['ma20']: tech_score += 10
+        tech_score = min(99, max(1, int(tech_score)))
+
+        # 消息面 (真實新聞列表)
         news_list = get_real_news(stock)
-        news_score = 50 # 這裡保持中性，讓前端顯示新聞列表即可
+        news_score = 50 # 中性
 
-        # E. 計算總分 (權威運算)
-        # 權重分配：技術 40%, 基本 20%, 籌碼 20%, 消息 20%
-        total_score = int(tech_score * 0.4 + fund_score * 0.2 + chip_score * 0.2 + news_score * 0.2)
+        # 總分
+        total_score = int(tech_score*0.4 + fund_score*0.2 + chip_score*0.2 + news_score*0.2)
 
-        # 準備前端需要的圖表數據
+        # SRS #8 風險運算
+        daily_returns = hist['Close'].pct_change().dropna()
+        var_95 = calculate_var(daily_returns)
+        max_loss = req.principal * abs(var_95)
+
+        # SRS #6 建議價位 (ATR)
+        high_low = hist['High'] - hist['Low']
+        atr = high_low.rolling(14).mean().iloc[-1]
+        price = hist['Close'].iloc[-1]
+
+        # SRS #4 ROI 預估
+        roi = {
+            "1d": round(daily_returns.iloc[-1] * 100, 2),
+            "1w": round(hist['Close'].pct_change(5).iloc[-1] * 100, 2),
+            "1m": round(hist['Close'].pct_change(20).iloc[-1] * 100, 2),
+            "1y": round(hist['Close'].pct_change(250).iloc[-1] * 100, 2)
+        }
+
+        # 圖表數據
         dates = hist.index.strftime('%Y-%m-%d').tolist()
         prices = hist['Close'].tolist()
-        
-        # 簡單趨勢預測線 (未來 5 天)
-        last_price = prices[-1]
-        trend = 1.002 if tech_score > 60 else 0.998
-        future_dates = []
-        future_means = []
-        last_date_obj = datetime.datetime.strptime(dates[-1], '%Y-%m-%d')
-        
-        for i in range(1, 6):
-            next_d = last_date_obj + datetime.timedelta(days=i)
-            future_dates.append(next_d.strftime('%Y-%m-%d'))
-            future_means.append(round(last_price * (trend ** i), 2))
 
-        # 最終回傳結構
-        result = {
-            "ticker": ticker,
-            "current_price": round(last_price, 2),
-            "total_score": total_score,
-            "evaluation": "多頭" if total_score > 65 else "觀望",
-            "recommendation": "買進" if total_score > 70 else "持有",
-            "details": {
-                "tech": tech_score,
-                "fund": fund_score,
-                "chip": chip_score,
-                "news": news_score
+        return {
+            "symbol": ticker,
+            "current_price": round(price, 2),
+            "ai_score": total_score,
+            "evaluation": "多頭" if total_score > 60 else "空頭",
+            "scores": {"tech": tech_score, "fund": fund_score, "chip": chip_score, "news": news_score},
+            "roi": roi,
+            "risk": {
+                "var_95_pct": round(var_95 * 100, 2),
+                "max_loss_est": round(max_loss, 0)
             },
-            # 傳回伺服器算好的精準指標
-            "tech_indicators": tech_data,
-            # 傳回真實新聞列表
-            "news_list": news_list,
-            # 傳回圖表數據
+            "strategy": {
+                "entry": round(price, 2),
+                "stop_loss": round(price - atr*2, 2),
+                "take_profit": round(price + atr*3, 2)
+            },
+            "patterns": detect_patterns(hist),
+            "tech_details": tech_data,
+            "news": news_list,
             "chart_data": {
                 "history_date": dates,
-                "history_price": [round(p, 2) for p in prices],
-                "future_date": future_dates,
-                "future_mean": future_means
-            }
+                "history_price": [round(p, 2) for p in prices]
+            },
+            # 兼容舊前端欄位
+            "totalScore": total_score, 
+            "currentPrice": round(price, 2),
+            "recommendation": "買進" if total_score > 70 else "持有",
+            "details": {"tech": tech_score, "fund": fund_score, "chip": chip_score, "news": news_score},
+            "tech_indicators": tech_data,
+            "news_list": news_list
         }
-        
-        cache[ticker] = result
-        return result
 
     except Exception as e:
-        print(f"Server Error: {e}")
-        raise HTTPException(status_code=500, detail="Analysis Failed")
+        print(f"Analyze Error: {e}")
+        raise HTTPException(status_code=500, detail="後端運算錯誤")
+
+# 3. 排行榜 (SRS #11)
+@app.get("/api/rankings")
+def get_rankings(user: str = Depends(get_current_user)):
+    if "global_rank" in rank_cache: return rank_cache["global_rank"]
+    
+    # 掃描熱門股
+    targets = ["2330.TW", "NVDA", "AAPL", "2317.TW", "TSLA", "AMD", "MSFT"]
+    results = []
+    for t in targets:
+        try:
+            s = yf.Ticker(t)
+            h = s.history(period="5d")
+            if not h.empty:
+                p = h['Close'].iloc[-1]
+                chg = (p - h['Close'].iloc[0]) / h['Close'].iloc[0]
+                results.append({"ticker": t, "price": round(p,2), "change_pct": round(chg*100,2), "score": 80 if chg>0 else 45})
+        except: pass
+    
+    # 依漲幅排序
+    results.sort(key=lambda x: x['change_pct'], reverse=True)
+    rank_cache["global_rank"] = results
+    return results
+
+# 4. User Data (收藏 & 資產)
+@app.get("/api/favorites")
+def get_favorites(user: str = Depends(get_current_user)):
+    return favorites_db.get(user, [])
+
+@app.post("/api/favorites/{symbol}")
+def add_favorite(symbol: str, user: str = Depends(get_current_user)):
+    favs = favorites_db.get(user, [])
+    if symbol not in favs: favs.append(symbol)
+    return favs
+
+@app.delete("/api/favorites/{symbol}")
+def remove_favorite(symbol: str, user: str = Depends(get_current_user)):
+    favs = favorites_db.get(user, [])
+    if symbol in favs: favs.remove(symbol)
+    return favs
+
+@app.get("/api/portfolio")
+def get_portfolio(user: str = Depends(get_current_user)):
+    return portfolio_db.get(user, [])
+
+@app.post("/api/portfolio/add")
+def add_position(item: PortfolioItem, user: str = Depends(get_current_user)):
+    if user not in portfolio_db: portfolio_db[user] = []
+    portfolio_db[user].append(item.dict())
+    return {"msg": "Added"}
+
+@app.delete("/api/portfolio/{symbol}")
+def delete_position(symbol: str, user: str = Depends(get_current_user)):
+    if user in portfolio_db:
+        portfolio_db[user] = [p for p in portfolio_db[user] if p['symbol'] != symbol]
+    return {"msg": "Deleted"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
