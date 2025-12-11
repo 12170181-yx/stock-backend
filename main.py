@@ -1,306 +1,355 @@
-import uvicorn
-from fastapi import FastAPI, HTTPException, Depends
+import sqlite3
+import datetime
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
-import datetime
-from cachetools import TTLCache
+from sklearn.linear_model import LinearRegression
 
-app = FastAPI(title="AI Stock Analysis API - Public Mode")
+# --- 設定與初始化 ---
+app = FastAPI()
 
-# --- CORS 設定 ---
+# 允許 CORS (讓前端 Vercel 可以呼叫)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 生產環境建議改為前端的 Vercel 網址
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 模擬資料庫 (公開測試用) ---
-# 所有人都共用 "demo_user" 的資料，方便測試
-demo_portfolio = [] 
-demo_favorites = []
+# JWT 設定
+SECRET_KEY = "your_secret_key_here_please_change"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# --- 快取設定 ---
-cache = TTLCache(maxsize=200, ttl=1800) # 30分鐘
-rank_cache = TTLCache(maxsize=1, ttl=3600) # 1小時
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# --- 資料模型 ---
+# 資料庫初始化
+def init_db():
+    conn = sqlite3.connect('stock_app.db')
+    c = conn.cursor()
+    # 使用者表
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (username TEXT PRIMARY KEY, hashed_password TEXT)''')
+    # 模擬持倉表
+    c.execute('''CREATE TABLE IF NOT EXISTS portfolio
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, 
+                  symbol TEXT, shares INTEGER, avg_cost REAL)''')
+    # 收藏表
+    c.execute('''CREATE TABLE IF NOT EXISTS favorites
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, symbol TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- 模型定義 (Pydantic) ---
+class User(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class AnalysisRequest(BaseModel):
+    symbol: str
+    principal: float
+    strategy: str
+    duration: str
+
 class PortfolioItem(BaseModel):
     symbol: str
-    cost_price: float
     shares: int
-    date: str
+    cost: float
 
-class AnalyzeRequest(BaseModel):
-    symbol: str
-    principal: int = 100000
-    risk: str = "neutral"
+# --- 輔助函式 ---
+def get_db():
+    conn = sqlite3.connect('stock_app.db')
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# --- 核心演算法 ---
-def calculate_technicals(df):
-    if len(df) < 60: return None
-    close = df['Close']
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    return username
+
+# --- 核心 AI 分析邏輯 ---
+def calculate_ai_metrics(df: pd.DataFrame, symbol: str):
+    """
+    計算 AI 評分、預測與風險指標
+    """
+    if len(df) < 60:
+        return None
+
+    # 1. 準備數據
+    close_prices = df['Close'].values
     
-    # RSI (14)
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    # 2. 技術指標計算 (簡化版)
+    # RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
+    current_rsi = rsi.iloc[-1]
 
-    # MACD
-    exp12 = close.ewm(span=12, adjust=False).mean()
-    exp26 = close.ewm(span=26, adjust=False).mean()
-    macd = exp12 - exp26
+    # MA (均線)
+    ma5 = df['Close'].rolling(window=5).mean().iloc[-1]
+    ma20 = df['Close'].rolling(window=20).mean().iloc[-1]
+    ma60 = df['Close'].rolling(window=60).mean().iloc[-1]
+
+    # 3. AI 評分 (0-100)
+    score = 50  # 基礎分
+    # 技術面權重
+    if current_rsi < 30: score += 10 # 超賣反彈
+    elif current_rsi > 70: score -= 5 # 超買風險
+    if ma5 > ma20: score += 10 # 短期多頭
+    if ma20 > ma60: score += 10 # 中期多頭
     
-    # Bollinger
-    sma20 = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
-    upper = sma20 + (std20 * 2)
-    lower = sma20 - (std20 * 2)
+    # 簡單動能
+    returns = df['Close'].pct_change()
+    volatility = returns.std() * np.sqrt(252)
+    if volatility < 0.2: score += 5 # 波動穩定加分
 
-    # KD
-    low_min = df['Low'].rolling(9).min()
-    high_max = df['High'].rolling(9).max()
-    rsv = ((close - low_min) / (high_max - low_min)) * 100
-    k = rsv.ewm(com=2).mean()
-    d = k.ewm(com=2).mean()
+    score = min(max(int(score), 0), 100)
+    
+    # 評語
+    if score >= 80: sentiment = "強力看多"
+    elif score >= 60: sentiment = "偏多"
+    elif score >= 40: sentiment = "中立"
+    else: sentiment = "偏空"
 
-    # MA
-    ma5 = close.rolling(5).mean()
-    ma20 = sma20
-    ma60 = close.rolling(60).mean()
+    # 4. 股價預測 (線性回歸模擬)
+    # 使用最近 30 天預測未來 10 天
+    X = np.arange(len(df))[-30:].reshape(-1, 1)
+    y = close_prices[-30:]
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    future_days = 10
+    future_X = np.arange(len(df), len(df) + future_days).reshape(-1, 1)
+    future_pred = model.predict(future_X)
+    
+    prediction_data = []
+    last_date = df.index[-1]
+    for i, price in enumerate(future_pred):
+        next_date = last_date + datetime.timedelta(days=i+1)
+        prediction_data.append({
+            "date": next_date.strftime('%Y-%m-%d'),
+            "predicted_price": round(price, 2)
+        })
 
-    def safe(series):
-        val = series.iloc[-1]
-        return float(val) if not np.isnan(val) else 0.0
+    # 5. 極端行情風險 (VaR 95%)
+    # 歷史模擬法
+    sorted_returns = returns.dropna().sort_values()
+    var_95 = sorted_returns.quantile(0.05) # 95% 信心水準的單日最大跌幅
+    
+    current_price = close_prices[-1]
+    pessimistic_price = current_price * (1 + var_95)
 
     return {
-        "rsi": safe(rsi),
-        "macd": safe(macd),
-        "upper": safe(upper),
-        "lower": safe(lower),
-        "k": safe(k),
-        "d": safe(d),
-        "ma5": safe(ma5),
-        "ma20": safe(ma20),
-        "ma60": safe(ma60),
-        "price": safe(close)
+        "current_price": round(current_price, 2),
+        "score": score,
+        "sentiment": sentiment,
+        "rsi": round(current_rsi, 2),
+        "ma5": round(ma5, 2),
+        "ma20": round(ma20, 2),
+        "var_95_percent": round(var_95 * 100, 2),
+        "pessimistic_price": round(pessimistic_price, 2),
+        "prediction": prediction_data,
+        "history": [{"date": d.strftime('%Y-%m-%d'), "price": round(p, 2)} for d, p in zip(df.index[-60:], df['Close'][-60:])]
     }
 
-def get_twse_chip(stock_code):
-    if not (stock_code.isdigit() and len(stock_code) == 4): return 0
+# --- API Endpoints ---
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE username=?", (form_data.username,))
+    user_row = c.fetchone()
+    conn.close()
+    
+    if not user_row or not verify_password(form_data.password, user_row['hashed_password']):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    access_token = create_access_token(data={"sub": user_row['username']})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/register")
+async def register(user: User):
+    conn = get_db()
+    c = conn.cursor()
     try:
-        url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            if 'data' in data:
-                for row in data['data']:
-                    if row[0] == stock_code:
-                        return int(row[-1].replace(',', ''))
-    except: pass
-    return 0
+        hashed_pw = get_password_hash(user.password)
+        c.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", 
+                  (user.username, hashed_pw))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+    conn.close()
+    return {"message": "User created successfully"}
 
-def get_real_news(stock):
-    try:
-        news = stock.news
-        result = []
-        for n in news[:5]:
-            result.append({
-                "title": n.get('title'),
-                "link": n.get('link'),
-                "publisher": n.get('publisher', 'Yahoo')
-            })
-        return result
-    except: return []
-
-def detect_patterns(df):
-    patterns = []
-    if len(df) < 5: return patterns
-    last = df.iloc[-1]
-    body = abs(last['Close'] - last['Open'])
-    upper = last['High'] - max(last['Close'], last['Open'])
-    lower = min(last['Close'], last['Open']) - last['Low']
-    
-    if lower > body * 2: patterns.append("錘子線")
-    if last['Close'] > last['Open'] and body > (last['High']-last['Low'])*0.8: patterns.append("長紅K")
-    
-    ma5 = df['Close'].rolling(5).mean()
-    ma20 = df['Close'].rolling(20).mean()
-    if ma5.iloc[-1] > ma20.iloc[-1] and ma5.iloc[-2] <= ma20.iloc[-2]: patterns.append("MA金叉")
-    
-    return patterns
-
-# --- API Endpoints (無須驗證) ---
-
-@app.get("/")
-def home():
-    return {"status": "Public_Backend_Ready"}
-
-# 1. 深度分析
 @app.post("/api/analyze")
-def analyze(req: AnalyzeRequest):
-    ticker = req.symbol.upper()
-    
-    if ticker in cache: return cache[ticker]
-
+async def analyze_stock(request: AnalysisRequest):
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1y")
-        if hist.empty: raise HTTPException(status_code=404, detail="No Data")
-
-        # 技術面
-        tech_data = calculate_technicals(hist)
-        tech_score = 50
-        if tech_data:
-            if tech_data['rsi'] > 70: tech_score = 85
-            elif tech_data['rsi'] < 30: tech_score = 25
-            else: tech_score = 50 + (tech_data['rsi'] - 50) * 0.5
-            
-            if tech_data['price'] > tech_data['ma20']: tech_score += 10
-            if tech_data['ma5'] > tech_data['ma20']: tech_score += 10
-        tech_score = min(99, max(1, int(tech_score)))
-
-        # 基本面
-        info = stock.info
-        fund_score = 50
-        if info.get('trailingEps', 0) > 0: fund_score += 20
-        if info.get('returnOnEquity', 0) > 0.1: fund_score += 20
-        pe = info.get('trailingPE', 0)
-        if 0 < pe < 25: fund_score += 10
-        fund_score = min(99, max(1, fund_score))
-
-        # 籌碼面
-        chip_val = 0
-        if ".TW" in ticker:
-            chip_val = get_twse_chip(ticker.split('.')[0])
-        chip_score = 50
-        if chip_val > 1000000: chip_score = 85
-        elif chip_val > 0: chip_score = 60
-        elif chip_val < -1000000: chip_score = 25
-        elif chip_val < 0: chip_score = 40
-
-        # 新聞與總分
-        news_list = get_real_news(stock)
-        news_score = 50
-        total_score = int(tech_score*0.4 + fund_score*0.2 + chip_score*0.2 + news_score*0.2)
-
-        # 其他數據
-        returns = hist['Close'].pct_change().dropna()
-        var_95 = returns.quantile(0.05) if len(returns) > 0 else 0
-        max_loss = req.principal * abs(var_95)
-
-        high_low = hist['High'] - hist['Low']
-        atr = high_low.rolling(14).mean().iloc[-1]
-        price = hist['Close'].iloc[-1]
+        # 1. 獲取數據
+        ticker = yf.Ticker(request.symbol)
+        df = ticker.history(period="1y")
         
-        dates = hist.index.strftime('%Y-%m-%d').tolist()
-        prices = hist['Close'].tolist()
-        
-        # 預測線
-        future_dates = []
-        future_means = []
-        last_date = datetime.datetime.strptime(dates[-1], '%Y-%m-%d')
-        trend = 1.002 if tech_score > 60 else 0.998
-        for i in range(1, 6):
-            future_dates.append((last_date + datetime.timedelta(days=i)).strftime('%Y-%m-%d'))
-            future_means.append(round(price * (trend ** i), 2))
+        if df.empty:
+            raise HTTPException(status_code=404, detail="Stock not found")
 
-        result = {
-            "symbol": ticker,
-            "current_price": round(price, 2),
-            "ai_score": total_score,
-            "evaluation": "多頭" if total_score > 60 else "空頭",
-            "recommendation": "買進" if total_score > 70 else "持有",
-            "scores": {"tech": tech_score, "fund": fund_score, "chip": chip_score, "news": news_score},
-            "roi": {
-                "1d": round(returns.iloc[-1]*100, 2),
-                "1w": round(hist['Close'].pct_change(5).iloc[-1]*100, 2),
-                "1m": round(hist['Close'].pct_change(20).iloc[-1]*100, 2),
-                "1y": round(hist['Close'].pct_change(250).iloc[-1]*100, 2)
+        # 2. 執行 AI 分析
+        ai_result = calculate_ai_metrics(df, request.symbol)
+        if not ai_result:
+            raise HTTPException(status_code=400, detail="Not enough data for analysis")
+
+        current_price = ai_result['current_price']
+        
+        # 3. 計算資金配置
+        max_shares = int(request.principal // current_price)
+        cost = max_shares * current_price
+        
+        # 4. 波段建議
+        buy_price = current_price
+        take_profit = buy_price * 1.20
+        stop_loss = buy_price * 0.90
+        
+        # 5. ROI 預估 (ROI 模組)
+        # 這裡做簡化假設：假設每日平均波動為 1.5%
+        roi_day = cost * 0.015
+        roi_week = cost * 0.04
+        roi_month = cost * 0.12
+        roi_year = cost * 0.25 # 假設年化 25%
+
+        return {
+            "symbol": request.symbol.upper(),
+            "price": current_price,
+            "ai_score": ai_result['score'],
+            "ai_sentiment": ai_result['sentiment'],
+            "technical": {
+                "rsi": ai_result['rsi'],
+                "ma5": ai_result['ma5'],
+                "ma20": ai_result['ma20']
             },
-            "risk": {
-                "var_95_pct": round(var_95*100, 2),
-                "max_loss_est": round(max_loss, 0)
+            "money_management": {
+                "principal": request.principal,
+                "max_shares": max_shares,
+                "total_cost": cost,
+                "risk_loss_10_percent": cost * 0.1
             },
-            "strategy": {
-                "entry": round(price, 2),
-                "stop_loss": round(price - atr*2, 2),
-                "take_profit": round(price + atr*3, 2)
+            "advice": {
+                "buy_price": buy_price,
+                "take_profit": round(take_profit, 2),
+                "stop_loss": round(stop_loss, 2)
             },
-            "patterns": detect_patterns(hist),
-            "tech_details": tech_data,
-            "news_list": news_list,
+            "roi_estimates": {
+                "day": {"amt": round(roi_day), "pct": 1.5},
+                "week": {"amt": round(roi_week), "pct": 4.0},
+                "month": {"amt": round(roi_month), "pct": 12.0},
+                "year": {"amt": round(roi_year), "pct": 25.0}
+            },
+            "risk_analysis": {
+                "max_drawdown_pct": ai_result['var_95_percent'],
+                "max_loss_amt": round(cost * (abs(ai_result['var_95_percent'])/100)),
+                "pessimistic_price": ai_result['pessimistic_price']
+            },
             "chart_data": {
-                "history_date": dates,
-                "history_price": [round(p, 2) for p in prices],
-                "future_date": future_dates,
-                "future_mean": future_means
-            },
-            "totalScore": total_score,
-            "currentPrice": round(price, 2),
-            "details": {"tech": tech_score, "fund": fund_score, "chip": chip_score, "news": news_score},
-            "tech_indicators": tech_data
+                "history": ai_result['history'],
+                "prediction": ai_result['prediction']
+            }
         }
-        
-        cache[ticker] = result
-        return result
-
     except Exception as e:
         print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail="分析失敗")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# 2. 排行榜
-@app.get("/api/rankings")
-def get_rankings():
-    if "global_rank" in rank_cache: return rank_cache["global_rank"]
-    targets = ["2330.TW", "NVDA", "AAPL", "2317.TW", "TSLA", "AMD", "MSFT"]
-    results = []
-    for t in targets:
-        try:
-            s = yf.Ticker(t)
-            h = s.history(period="5d")
-            if not h.empty:
-                p = h['Close'].iloc[-1]
-                chg = (p - h['Close'].iloc[0]) / h['Close'].iloc[0]
-                results.append({"ticker": t, "price": round(p,2), "change_pct": round(chg*100,2), "score": 80 if chg>0 else 45})
-        except: pass
-    rank_cache["global_rank"] = results
-    return results
+@app.get("/api/news")
+async def get_news():
+    # 模擬新聞數據
+    # 在真實環境中，這裡可以接 Google News API 或 yfinance 的 news 屬性
+    return [
+        {"time": "3 分鐘前", "title": "聯準會暗示暫停升息，科技股大漲", "source": "Bloomberg"},
+        {"time": "15 分鐘前", "title": "AI 晶片需求強勁，供應鏈產能滿載", "source": "Reuters"},
+        {"time": "1 小時前", "title": "地緣政治風險升溫，油價波動加劇", "source": "CNBC"},
+    ]
 
-# 3. 模擬資產 & 收藏 (公開版)
-@app.get("/api/favorites")
-def get_favorites(): return demo_favorites
-
-@app.post("/api/favorites/{symbol}")
-def add_favorite(symbol: str):
-    if symbol not in demo_favorites: demo_favorites.append(symbol)
-    return demo_favorites
-
-@app.delete("/api/favorites/{symbol}")
-def remove_favorite(symbol: str):
-    if symbol in demo_favorites: demo_favorites.remove(symbol)
-    return demo_favorites
-
+# 模擬資產相關 API
 @app.get("/api/portfolio")
-def get_portfolio(): return demo_portfolio
+async def get_portfolio(user: str = Depends(get_current_user)):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM portfolio WHERE username=?", (user,))
+    rows = c.fetchall()
+    portfolio = []
+    total_asset = 0
+    total_cost = 0
+    
+    for row in rows:
+        # 簡單起見，這裡不即時抓現價，實際應再 call yfinance
+        current_price = row['avg_cost'] * 1.05 # 假裝賺 5%
+        value = row['shares'] * current_price
+        portfolio.append({
+            "symbol": row['symbol'],
+            "shares": row['shares'],
+            "cost": row['avg_cost'],
+            "market_value": round(value),
+            "pnl": round(value - (row['shares'] * row['avg_cost']))
+        })
+        total_asset += value
+        total_cost += (row['shares'] * row['avg_cost'])
+        
+    conn.close()
+    return {
+        "total_asset": round(total_asset),
+        "total_cost": round(total_cost),
+        "unrealized_pnl": round(total_asset - total_cost),
+        "holdings": portfolio
+    }
 
 @app.post("/api/portfolio/add")
-def add_position(item: PortfolioItem):
-    demo_portfolio.append(item.dict())
-    return {"msg": "Added"}
-
-@app.delete("/api/portfolio/{symbol}")
-def delete_position(symbol: str):
-    global demo_portfolio
-    demo_portfolio = [p for p in demo_portfolio if p['symbol'] != symbol]
-    return {"msg": "Deleted"}
+async def add_to_portfolio(item: PortfolioItem, user: str = Depends(get_current_user)):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO portfolio (username, symbol, shares, avg_cost) VALUES (?, ?, ?, ?)",
+              (user, item.symbol, item.shares, item.cost))
+    conn.commit()
+    conn.close()
+    return {"message": "Added to portfolio"}
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
