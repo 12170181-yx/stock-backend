@@ -1,116 +1,102 @@
-# ===============================
-# 檔案：stock-backend/main.py
-# 目的：強化登入/註冊、修正 API 可上線、補齊收藏/新聞/K線詳細分析(需登入)
-# FastAPI + SQLite + JWT + yfinance
-# ===============================
-
 import os
 import re
 import time
 import sqlite3
 import datetime
 from typing import Optional, List, Dict, Any
+from email.utils import parsedate_to_datetime
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from fastapi import FastAPI, HTTPException, Depends, status, Query
+from fastapi import FastAPI, HTTPException, Depends, status, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
+# ====== 可選：真實新聞 RSS 解析（下一個 requirements.txt 會補 feedparser）======
+try:
+    import feedparser  # type: ignore
+except Exception:
+    feedparser = None
 
-# -----------------------------
-# 基本設定（可用環境變數覆蓋）
-# -----------------------------
-APP_NAME = os.getenv("APP_NAME", "stock-backend")
-DB_PATH = os.getenv("DB_PATH", "stock_app.db")
 
-# ⚠️ 上線務必改成環境變數（Render / Vercel）
-SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key_here_please_change")
+# ==========================
+# 0) 設定
+# ==========================
+APP_NAME = "stock-backend"
+
+# Render / 本機環境變數
+DATABASE_PATH = os.getenv("DATABASE_PATH", "stock_app.db")
+SECRET_KEY = os.getenv("SECRET_KEY", "PLEASE_CHANGE_THIS_SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
 
-# CORS（可用逗號分隔多個）
-# 建議至少填入你的 Vercel 網址：https://stock-frontend-theta.vercel.app
-cors_origins_env = os.getenv("CORS_ORIGINS", "*")
-if cors_origins_env.strip() == "*":
-    CORS_ORIGINS = ["*"]
-else:
-    CORS_ORIGINS = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+# 你前端的正式網址
+VERCEL_FRONTEND = os.getenv("VERCEL_FRONTEND", "https://stock-frontend-theta.vercel.app")
 
+# CORS：正式建議指定你的前端網域 + 本機測試
+ALLOWED_ORIGINS = list({
+    VERCEL_FRONTEND,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+})
 
-# -----------------------------
-# App 初始化
-# -----------------------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
 app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-
-# -----------------------------
-# 帳密規則（後端也要驗證）
-# -----------------------------
-USERNAME_REGEX = re.compile(r"^[A-Za-z0-9_]{4,20}$")
-
-
-def validate_username(username: str) -> None:
-    if not USERNAME_REGEX.match(username or ""):
-        raise HTTPException(
-            status_code=400,
-            detail="帳號格式不正確：需 4–20 碼，且僅能包含英文、數字、底線（_）"
-        )
-
-
-def validate_password(password: str) -> None:
-    if password is None:
-        raise HTTPException(status_code=400, detail="密碼不可為空")
-    if len(password) < 8:
-        raise HTTPException(status_code=400, detail="密碼格式不正確：至少 8 碼")
-    if not re.search(r"[A-Za-z]", password):
-        raise HTTPException(status_code=400, detail="密碼格式不正確：需包含至少 1 個英文字母")
-    if not re.search(r"[0-9]", password):
-        raise HTTPException(status_code=400, detail="密碼格式不正確：需包含至少 1 個數字")
-
-
-# -----------------------------
-# DB 初始化
-# -----------------------------
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# ==========================
+# 1) DB 初始化
+# ==========================
+def get_db():
+    conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db() -> None:
+def init_db():
     conn = get_db()
     c = conn.cursor()
 
-    # users
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
             hashed_password TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
         """
     )
 
-    # portfolio
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(username, symbol)
+        )
+        """
+    )
+
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS portfolio (
@@ -119,30 +105,8 @@ def init_db() -> None:
             symbol TEXT NOT NULL,
             shares INTEGER NOT NULL,
             avg_cost REAL NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(username) REFERENCES users(username)
+            created_at TEXT NOT NULL
         )
-        """
-    )
-
-    # favorites
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS favorites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(username) REFERENCES users(username)
-        )
-        """
-    )
-
-    # favorites unique index（同一使用者同一股票不可重複收藏）
-    c.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_fav_unique
-        ON favorites(username, symbol)
         """
     )
 
@@ -153,10 +117,10 @@ def init_db() -> None:
 init_db()
 
 
-# -----------------------------
-# Pydantic Models
-# -----------------------------
-class User(BaseModel):
+# ==========================
+# 2) Pydantic Models
+# ==========================
+class UserCreate(BaseModel):
     username: str
     password: str
 
@@ -170,7 +134,11 @@ class AnalysisRequest(BaseModel):
     symbol: str
     principal: float
     strategy: str
-    duration: str  # "當沖(1日)" / "短期(5日)" / "中期(60日)" / "長期(1年)"
+    duration: str  # day/short/mid/long
+
+
+class FavoriteReq(BaseModel):
+    symbol: str
 
 
 class PortfolioItem(BaseModel):
@@ -179,13 +147,13 @@ class PortfolioItem(BaseModel):
     cost: float
 
 
-class FavoriteItem(BaseModel):
-    symbol: str
+# ==========================
+# 3) Auth helpers
+# ==========================
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,20}$")
+PASSWORD_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
 
 
-# -----------------------------
-# Auth Helpers
-# -----------------------------
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -194,834 +162,984 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
+def create_access_token(subject: str) -> str:
     expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+    to_encode = {"sub": subject, "exp": expire}
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
-    credentials_exception = HTTPException(
+    cred_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="尚未登入或登入已過期，請重新登入",
+        detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: Optional[str] = payload.get("sub")
+        username = payload.get("sub")
         if not username:
-            raise credentials_exception
+            raise cred_exc
         return username
     except JWTError:
-        raise credentials_exception
+        raise cred_exc
 
 
-# -----------------------------
-# 小工具：時間戳 → 幾分鐘前
-# -----------------------------
-def time_ago(ts: int) -> str:
-    # ts: unix seconds
-    now = int(time.time())
-    diff = max(0, now - int(ts))
-    if diff < 60:
-        return "剛剛"
-    if diff < 3600:
-        return f"{diff // 60} 分鐘前"
-    if diff < 86400:
-        return f"{diff // 3600} 小時前"
-    return f"{diff // 86400} 天前"
+# ==========================
+# 4) Data fetch（保證抓到「最新優先」）
+# ==========================
+def fetch_price_history(symbol: str, period: str = "1y") -> pd.DataFrame:
+    """
+    使用 yfinance 抓取公開行情資料。
+    規則：只要抓到資料，就以資料最後一筆日期作為「最新」依據。
+    """
+    # download 較穩定
+    df = yf.download(symbol, period=period, interval="1d", auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # 清理
+    df = df.dropna(subset=["Close"])
+    df.index = pd.to_datetime(df.index)
+    return df
 
 
-# -----------------------------
-# 技術指標（不依賴 TA-Lib）
-# -----------------------------
-def calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
     delta = close.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = gain / (loss.replace(0, np.nan))
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(method="bfill").fillna(50)
 
 
-def calc_ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - sig
+    return macd, sig, hist
 
 
-def calc_macd(close: pd.Series) -> Dict[str, pd.Series]:
-    ema12 = calc_ema(close, 12)
-    ema26 = calc_ema(close, 26)
-    macd = ema12 - ema26
-    signal = calc_ema(macd, 9)
-    hist = macd - signal
-    return {"macd": macd, "signal": signal, "hist": hist}
+def compute_bollinger(close: pd.Series, window: int = 20, k: float = 2.0):
+    ma = close.rolling(window).mean()
+    std = close.rolling(window).std()
+    upper = ma + k * std
+    lower = ma - k * std
+    return ma, upper, lower
 
 
-def calc_kd(df: pd.DataFrame, k_period: int = 9, d_period: int = 3) -> Dict[str, pd.Series]:
+def compute_kd(df: pd.DataFrame, k_period: int = 9, d_period: int = 3):
     low_min = df["Low"].rolling(k_period).min()
     high_max = df["High"].rolling(k_period).max()
     rsv = (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
-    k = rsv.rolling(d_period).mean()
-    d = k.rolling(d_period).mean()
-    return {"k": k.fillna(method="bfill").fillna(50), "d": d.fillna(method="bfill").fillna(50)}
+    k = rsv.ewm(alpha=1 / d_period, adjust=False).mean()
+    d = k.ewm(alpha=1 / d_period, adjust=False).mean()
+    return k.fillna(50), d.fillna(50)
 
 
-def calc_bollinger(close: pd.Series, period: int = 20, n_std: float = 2.0) -> Dict[str, pd.Series]:
-    ma = close.rolling(period).mean()
-    std = close.rolling(period).std()
-    upper = ma + n_std * std
-    lower = ma - n_std * std
-    return {"mid": ma, "upper": upper, "lower": lower}
+# ==========================
+# 5) 四大面向評分（可重現、同資料同分數）
+# ==========================
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
-# -----------------------------
-# K線形態（先做常見偵測 + 48 型態清單供前端顯示）
-# -----------------------------
-CANDLE_PATTERN_48 = [
-    # 這裡提供「名稱清單」，前端要展示 48 種型態用
-    "錘子線(Hammer)", "倒錘子線(Inverted Hammer)", "上吊線(Hanging Man)", "流星線(Shooting Star)",
-    "吞噬(Engulfing)", "穿頭破腳(Piercing / Dark Cloud Cover)", "晨星(Morning Star)", "夜星(Evening Star)",
-    "十字線(Doji)", "墓碑十字(Gravestone Doji)", "蜻蜓十字(Dragonfly Doji)", "長腳十字(Long-Legged Doji)",
-    "紅三兵(Three White Soldiers)", "黑三鴉(Three Black Crows)", "上升三法(Rising Three Methods)", "下降三法(Falling Three Methods)",
-    "孕線(Harami)", "十字孕線(Harami Cross)", "刺透線(Piercing Line)", "烏雲蓋頂(Dark Cloud Cover)",
-    "三內升(Three Inside Up)", "三內降(Three Inside Down)", "三外升(Three Outside Up)", "三外降(Three Outside Down)",
-    "跳空缺口(Gap)", "島型反轉(Island Reversal)", "塔形頂/底(Tower Top/Bottom)", "捉腰帶(Belt Hold)",
-    "踢腳線(Kicking)", "夾擊線(Meeting Lines)", "分離線(Separating Lines)", "斬回線(Thrusting)",
-    "倒錘反轉(Inverted Hammer Reversal)", "錘反轉(Hammer Reversal)", "長紅/長黑(Strong Body)", "紡錘線(Spinning Top)",
-    "內包(Inside Bar)", "外包(Outside Bar)", "長上影(Long Upper Shadow)", "長下影(Long Lower Shadow)",
-    "高浪線(High Wave)", "三線打擊(Three-Line Strike)", "棄嬰(Abandoned Baby)", "反轉十字(Reversal Doji)",
-    "盤整突破(Consolidation Breakout)", "假突破(False Breakout)", "頭肩頂(Head & Shoulders)", "頭肩底(Inverse H&S)"
-]
-
-
-def detect_basic_candle_patterns(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    先偵測常用幾種：Doji, Hammer, Engulfing, Morning Star（可後續擴充）
-    回傳：[{date, pattern, direction, confidence}]
-    """
-    out = []
-    if len(df) < 5:
-        return out
-
-    d = df.copy().tail(60)
-
-    for i in range(2, len(d)):
-        row = d.iloc[i]
-        prev = d.iloc[i - 1]
-        prev2 = d.iloc[i - 2]
-
-        o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
-        po, pc = float(prev["Open"]), float(prev["Close"])
-
-        body = abs(c - o)
-        rng = max(1e-9, h - l)
-        upper_shadow = h - max(o, c)
-        lower_shadow = min(o, c) - l
-
-        date_str = d.index[i].strftime("%Y-%m-%d")
-
-        # Doji：實體很小
-        if body / rng < 0.08:
-            out.append({"date": date_str, "pattern": "十字線(Doji)", "direction": "中性", "confidence": 0.55})
-
-        # Hammer：下影長、實體小、上影短（偏反轉）
-        if (lower_shadow / rng > 0.45) and (upper_shadow / rng < 0.15) and (body / rng < 0.35):
-            direction = "多轉" if c >= o else "多轉(弱)"
-            out.append({"date": date_str, "pattern": "錘子線(Hammer)", "direction": direction, "confidence": 0.70})
-
-        # Engulfing：吞噬
-        # 多頭吞噬：前一根黑K，當天紅K且實體包住前一根實體
-        if (pc < po) and (c > o) and (c >= po) and (o <= pc):
-            out.append({"date": date_str, "pattern": "吞噬(Engulfing)", "direction": "多轉", "confidence": 0.72})
-        # 空頭吞噬：前一根紅K，當天黑K且實體包住前一根實體
-        if (pc > po) and (c < o) and (o >= pc) and (c <= po):
-            out.append({"date": date_str, "pattern": "吞噬(Engulfing)", "direction": "空轉", "confidence": 0.72})
-
-        # Morning Star（簡化版）：連續三根：黑K → 小實體 → 紅K，且紅K收盤回到第一根實體中段以上
-        o2, c2 = float(prev2["Open"]), float(prev2["Close"])
-        if (c2 < o2) and (abs(pc - po) / max(1e-9, float(prev["High"] - prev["Low"])) < 0.25) and (c > o):
-            mid_first = (o2 + c2) / 2.0
-            if c >= mid_first:
-                out.append({"date": date_str, "pattern": "晨星(Morning Star)", "direction": "多轉", "confidence": 0.75})
-
-    # 去重（同日同型態）
-    uniq = {}
-    for x in out:
-        key = (x["date"], x["pattern"], x["direction"])
-        uniq[key] = x
-    return list(uniq.values())
-
-
-# -----------------------------
-# 評分：用「真實數據」計算，確保同一份資料評分一致
-# -----------------------------
-def clamp(v: float, a: float, b: float) -> float:
-    return max(a, min(b, v))
-
-
-def score_technical(df: pd.DataFrame) -> float:
+def score_technical(df: pd.DataFrame) -> Dict[str, Any]:
     close = df["Close"]
-    rsi = calc_rsi(close).iloc[-1]
-    ma5 = close.rolling(5).mean().iloc[-1]
-    ma20 = close.rolling(20).mean().iloc[-1]
-    ma60 = close.rolling(60).mean().iloc[-1] if len(df) >= 60 else close.rolling(20).mean().iloc[-1]
+    rsi = compute_rsi(close)
+    macd, sig, hist = compute_macd(close)
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    ma120 = close.rolling(120).mean()
+    bb_ma, bb_up, bb_low = compute_bollinger(close)
+    k, d = compute_kd(df)
 
-    macd_pack = calc_macd(close)
-    macd_hist = macd_pack["hist"].iloc[-1]
+    # 取最新值
+    rsi_v = float(rsi.iloc[-1])
+    macd_v = float(macd.iloc[-1])
+    sig_v = float(sig.iloc[-1])
+    hist_v = float(hist.iloc[-1])
+    ma20_v = float(ma20.iloc[-1]) if not np.isnan(ma20.iloc[-1]) else float(close.iloc[-1])
+    ma60_v = float(ma60.iloc[-1]) if not np.isnan(ma60.iloc[-1]) else float(close.iloc[-1])
+    ma120_v = float(ma120.iloc[-1]) if not np.isnan(ma120.iloc[-1]) else float(close.iloc[-1])
+    k_v = float(k.iloc[-1])
+    d_v = float(d.iloc[-1])
 
-    # 趨勢分：均線多頭排列
-    trend = 0.0
-    if ma5 > ma20:
-        trend += 15
-    if ma20 > ma60:
-        trend += 15
+    price = float(close.iloc[-1])
 
-    # 動能分：RSI（超買扣、超賣加）
-    mom = 0.0
-    if rsi < 30:
-        mom += 18
-    elif rsi < 45:
-        mom += 8
-    elif rsi > 70:
-        mom -= 10
-    elif rsi > 60:
-        mom -= 4
+    # 分數設計：0-100，保證 deterministic（不亂抽樣）
+    s = 50.0
 
-    # MACD 柱狀體
-    macd_score = 0.0
-    if macd_hist > 0:
-        macd_score += 12
-    else:
-        macd_score -= 6
+    # 趨勢：均線多頭
+    if price > ma20_v:
+        s += 8
+    if ma20_v > ma60_v:
+        s += 10
+    if ma60_v > ma120_v:
+        s += 10
 
-    # 波動：用年化波動（越低越穩加分，但太低也不一定）
+    # 動能：MACD
+    if macd_v > sig_v:
+        s += 8
+    if hist_v > 0:
+        s += 4
+
+    # RSI：避免極端
+    if rsi_v < 30:
+        s += 6  # 超賣可能反彈
+    elif rsi_v > 70:
+        s -= 6  # 超買回檔風險
+
+    # KD：多空力道
+    if k_v > d_v:
+        s += 4
+    if k_v < 20:
+        s += 2
+    if k_v > 80:
+        s -= 2
+
+    # 波動：太暴衝扣分、適中加分
     ret = close.pct_change().dropna()
-    vol = float(ret.std() * np.sqrt(252)) if len(ret) > 10 else 0.3
-    vol_score = 0.0
-    if vol < 0.20:
-        vol_score += 10
-    elif vol < 0.30:
-        vol_score += 5
-    elif vol > 0.45:
-        vol_score -= 8
+    vol = float(ret.tail(60).std() * np.sqrt(252)) if len(ret) >= 30 else 0.35
+    if vol < 0.25:
+        s += 6
+    elif vol > 0.6:
+        s -= 6
 
-    base = 50.0
-    score = base + trend + mom + macd_score + vol_score
-    return clamp(score, 0, 100)
+    s = clamp(s, 0, 100)
+
+    return {
+        "score": int(round(s)),
+        "rsi": round(rsi_v, 2),
+        "macd": round(macd_v, 4),
+        "macd_signal": round(sig_v, 4),
+        "ma20": round(ma20_v, 2),
+        "ma60": round(ma60_v, 2),
+        "ma120": round(ma120_v, 2),
+        "bb_mid": round(float(bb_ma.iloc[-1]) if not np.isnan(bb_ma.iloc[-1]) else price, 2),
+        "bb_upper": round(float(bb_up.iloc[-1]) if not np.isnan(bb_up.iloc[-1]) else price, 2),
+        "bb_lower": round(float(bb_low.iloc[-1]) if not np.isnan(bb_low.iloc[-1]) else price, 2),
+        "kd_k": round(k_v, 2),
+        "kd_d": round(d_v, 2),
+        "annual_volatility": round(vol, 4),
+    }
 
 
-def score_fundamental_placeholder(symbol: str) -> float:
+def score_fundamental(symbol: str) -> Dict[str, Any]:
     """
-    基本面：若要做到真正完整（營收/毛利/ROE/FCF…）
-    需要接「台股財報來源」或付費 API。
-    目前先給一個「可重現」的 placeholder：用 yfinance 的一些欄位（不保證台股齊全）。
-    你後續若指定財報來源，我可以把這裡做成真完整版本。
+    基本面：使用 yfinance 公開資訊（可能部分標的沒有）
+    只要資料缺漏，就用中性值，避免亂跳。
     """
+    s = 50.0
+    info = {}
     try:
-        t = yf.Ticker(symbol)
-        info = t.info or {}
-        pe = info.get("trailingPE", None)
-        pb = info.get("priceToBook", None)
-
-        score = 55.0
-        if pe is not None:
-            if pe < 15:
-                score += 10
-            elif pe > 35:
-                score -= 8
-        if pb is not None:
-            if pb < 2:
-                score += 6
-            elif pb > 6:
-                score -= 6
-
-        return clamp(score, 0, 100)
+        info = yf.Ticker(symbol).info or {}
     except Exception:
-        return 55.0
+        info = {}
+
+    # 常見欄位（可能為 None）
+    roe = info.get("returnOnEquity", None)  # e.g. 0.25
+    profit_margin = info.get("profitMargins", None)
+    rev_g = info.get("revenueGrowth", None)
+    earn_g = info.get("earningsGrowth", None)
+    debt_to_eq = info.get("debtToEquity", None)
+    fwd_pe = info.get("forwardPE", None)
+    pb = info.get("priceToBook", None)
+
+    # ROE
+    if isinstance(roe, (int, float)):
+        if roe >= 0.2:
+            s += 12
+        elif roe >= 0.1:
+            s += 6
+        elif roe < 0.05:
+            s -= 6
+
+    # 利潤率
+    if isinstance(profit_margin, (int, float)):
+        if profit_margin >= 0.15:
+            s += 8
+        elif profit_margin < 0.05:
+            s -= 6
+
+    # 成長
+    for g in [rev_g, earn_g]:
+        if isinstance(g, (int, float)):
+            if g >= 0.15:
+                s += 6
+            elif g < 0:
+                s -= 6
+
+    # 負債（越高越扣）
+    if isinstance(debt_to_eq, (int, float)):
+        if debt_to_eq > 200:
+            s -= 10
+        elif debt_to_eq > 100:
+            s -= 6
+        elif debt_to_eq < 50:
+            s += 4
+
+    # 估值（非常粗略）
+    if isinstance(fwd_pe, (int, float)):
+        if fwd_pe < 12:
+            s += 5
+        elif fwd_pe > 30:
+            s -= 5
+
+    if isinstance(pb, (int, float)):
+        if pb < 2:
+            s += 3
+        elif pb > 6:
+            s -= 3
+
+    s = clamp(s, 0, 100)
+
+    # 回傳核心欄位（前端可顯示）
+    return {
+        "score": int(round(s)),
+        "roe": roe,
+        "profit_margin": profit_margin,
+        "revenue_growth": rev_g,
+        "earnings_growth": earn_g,
+        "debt_to_equity": debt_to_eq,
+        "forward_pe": fwd_pe,
+        "price_to_book": pb,
+    }
 
 
-def score_chip_placeholder(df: pd.DataFrame) -> float:
+def score_chip_proxy(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    籌碼面：台股法人/融資融券/大戶…需要專門資料源。
-    先用「量能趨勢」做可重現的近似：量增價漲偏多、量增價跌偏空。
+    籌碼面（台股常見三大法人等公開資料不一定有免費 API）
+    先用「量價/資金流代理指標」做可重現評分（不亂掰、不假裝法人資料）。
     """
-    if "Volume" not in df.columns or len(df) < 30:
-        return 55.0
-
     close = df["Close"]
-    vol = df["Volume"]
+    vol = df["Volume"].fillna(0)
 
-    vol20 = vol.rolling(20).mean().iloc[-1]
-    vol5 = vol.rolling(5).mean().iloc[-1]
-    ret5 = (close.iloc[-1] / close.iloc[-6] - 1) if len(close) >= 6 else 0.0
+    # OBV（簡化）
+    direction = np.sign(close.diff().fillna(0))
+    obv = (direction * vol).cumsum()
 
-    score = 55.0
-    if vol5 > vol20 * 1.2 and ret5 > 0:
-        score += 12
-    if vol5 > vol20 * 1.2 and ret5 < 0:
-        score -= 10
-    return clamp(score, 0, 100)
+    # 近20日 OBV 斜率：資金流入加分
+    x = np.arange(len(obv.tail(20))).reshape(-1, 1)
+    y = obv.tail(20).values.reshape(-1, 1)
+    slope = 0.0
+    if len(y) >= 10:
+        # 線性回歸斜率（不使用 sklearn，避免依賴）
+        x_mean = x.mean()
+        y_mean = y.mean()
+        slope = float(((x - x_mean) * (y - y_mean)).sum() / (((x - x_mean) ** 2).sum() + 1e-9))
 
+    # 量能：近5日均量 vs 近20日均量
+    v5 = float(vol.tail(5).mean())
+    v20 = float(vol.tail(20).mean())
+    vol_ratio = (v5 / v20) if v20 > 0 else 1.0
 
-def score_news_placeholder(news_items: List[Dict[str, Any]]) -> float:
-    """
-    消息面：真正情緒分析需要 NLP。
-    先用「新聞數量」做可重現近似：新聞多＝事件多，給中性略加權。
-    """
-    n = len(news_items)
-    score = 55.0
-    if n >= 10:
-        score += 8
-    elif n >= 5:
-        score += 4
-    return clamp(score, 0, 100)
-
-
-def calc_roi_estimates(principal_cost: float, close: pd.Series) -> Dict[str, Dict[str, float]]:
-    """
-    ROI：用歷史日報酬的平均 + 波動做估計（可重現、依據真實資料）
-    """
-    r = close.pct_change().dropna()
-    if len(r) < 50:
-        # fallback
-        day_mu = 0.001
-        day_sigma = 0.02
+    s = 50.0
+    if slope > 0:
+        s += 12
     else:
-        day_mu = float(r.mean())
-        day_sigma = float(r.std())
+        s -= 6
 
-    def est(days: int) -> Dict[str, float]:
-        # 期望報酬（線性近似）
-        exp_ret = day_mu * days
-        # 風險（簡化：sigma*sqrt(days)）
-        risk = day_sigma * np.sqrt(days)
-        # 避免太誇張（限制）
-        exp_ret = float(clamp(exp_ret, -0.35, 0.80))
-        amt = principal_cost * exp_ret
-        return {"pct": round(exp_ret * 100, 2), "amt": round(amt, 0)}
+    if vol_ratio >= 1.3:
+        s += 10  # 量增
+    elif vol_ratio <= 0.7:
+        s -= 6   # 量縮
+
+    s = clamp(s, 0, 100)
 
     return {
-        "day": est(1),
-        "short": est(5),
-        "mid": est(60),
-        "long": est(252),
+        "score": int(round(s)),
+        "obv_slope_20d": round(slope, 4),
+        "volume_ratio_5v20": round(vol_ratio, 4),
     }
 
 
-def calc_var95(close: pd.Series, horizon_days: int = 60) -> Dict[str, float]:
+def score_news_sentiment(news_items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    極端行情預警：用歷史日報酬分位數近似 VaR（可重現）
-    這裡回傳「60 天」極端跌幅估計與悲觀目標價
+    消息面：用公開新聞標題做「關鍵字情緒」代理評分（可重現）。
     """
-    r = close.pct_change().dropna()
-    if len(r) < 50:
-        q05 = -0.03
-        sigma = 0.02
-    else:
-        q05 = float(r.quantile(0.05))  # 單日 5% 分位
-        sigma = float(r.std())
+    s = 50.0
+    pos_kw = ["上調", "成長", "創新高", "強勁", "利多", "看好", "獲利", "大漲", "買超", "調升"]
+    neg_kw = ["下調", "衰退", "利空", "大跌", "賣超", "風險", "崩跌", "裁員", "警告", "疲弱"]
 
-    # 將單日分位放大到 60 天（簡化：乘 sqrt）
-    var_h = q05 * np.sqrt(horizon_days)
-    var_h = float(clamp(var_h, -0.60, 0.0))
+    titles = " ".join([(x.get("title") or "") for x in news_items]).lower()
 
-    current_price = float(close.iloc[-1])
-    pessimistic_price = current_price * (1 + var_h)
+    pos = sum([titles.count(k.lower()) for k in pos_kw])
+    neg = sum([titles.count(k.lower()) for k in neg_kw])
 
+    # 簡單可重現：pos/neg 影響分數
+    s += (pos * 2.5)
+    s -= (neg * 3.0)
+
+    s = clamp(s, 0, 100)
+    return {"score": int(round(s)), "pos_hits": pos, "neg_hits": neg}
+
+
+def composite_score(tech: int, fund: int, chip: int, news: int) -> int:
+    """
+    綜合分數：固定權重，確保同資料同結果（可重現、可驗證）。
+    """
+    # 權重可調：你要「技術面」比重高一點，我先給 0.35
+    score = 0.35 * tech + 0.25 * fund + 0.20 * chip + 0.20 * news
+    return int(round(clamp(score, 0, 100)))
+
+
+def sentiment_text(score: int) -> str:
+    if score >= 80:
+        return "強力看多"
+    if score >= 60:
+        return "偏多"
+    if score >= 40:
+        return "中立"
+    return "偏空"
+
+
+# ==========================
+# 6) ROI / 風險 / 價格區間
+# ==========================
+def estimate_roi(cost: float, df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    用歷史報酬均值+波動推估（代理模型，deterministic）
+    """
+    close = df["Close"]
+    ret = close.pct_change().dropna()
+    if ret.empty:
+        return {
+            "day": {"pct": 0.0, "amt": 0},
+            "short": {"pct": 0.0, "amt": 0},
+            "mid": {"pct": 0.0, "amt": 0},
+            "long": {"pct": 0.0, "amt": 0},
+        }
+
+    mu = float(ret.tail(120).mean())  # 近120日平均日報酬
+    sigma = float(ret.tail(120).std())  # 近120日波動
+
+    def horizon_pct(days: int) -> float:
+        # 保守：mu*days，並用波動做合理裁切（避免離譜）
+        p = mu * days
+        cap = max(0.08, 2.5 * sigma * np.sqrt(days))  # 波動越大 cap 越大
+        return float(clamp(p, -cap, cap))
+
+    horizons = {"day": 1, "short": 5, "mid": 60, "long": 252}
+    out = {}
+    for k, d in horizons.items():
+        pct = horizon_pct(d)
+        out[k] = {"pct": round(pct * 100, 2), "amt": int(round(cost * pct))}
+    return out
+
+
+def extreme_risk_95(cost: float, df: pd.DataFrame, horizon_days: int = 60) -> Dict[str, Any]:
+    """
+    極端行情預警：使用歷史單日 VaR 95% + sqrt(horizon) 近似
+    """
+    close = df["Close"]
+    ret = close.pct_change().dropna()
+    if ret.empty:
+        return {"max_loss_amt": 0, "max_loss_pct": 0.0, "pessimistic_price": float(close.iloc[-1])}
+
+    var1 = float(ret.quantile(0.05))  # 5% 分位（單日）
+    # horizon scale
+    var_h = var1 * np.sqrt(horizon_days)
+
+    price = float(close.iloc[-1])
+    pessimistic_price = price * (1 + var_h)
+
+    max_loss_amt = int(round(cost * abs(var_h)))
     return {
-        "var_h_pct": round(var_h * 100, 2),
+        "max_loss_amt": max_loss_amt,
+        "max_loss_pct": round(abs(var_h) * 100, 2),
         "pessimistic_price": round(pessimistic_price, 2),
+        "var_1d_pct": round(abs(var1) * 100, 2),
     }
 
 
-# -----------------------------
-# Routes
-# -----------------------------
+def band_trade_prices(current_price: float) -> Dict[str, float]:
+    buy = current_price
+    tp = current_price * 1.20
+    sl = current_price * 0.90
+    return {
+        "buy_price": round(buy, 2),
+        "take_profit": round(tp, 2),
+        "stop_loss": round(sl, 2),
+    }
+
+
+def build_chart_data(df: pd.DataFrame, future_days: int = 30) -> Dict[str, Any]:
+    """
+    給前端折線/區間帶使用：history + 以 log 線性趨勢做簡單外推 + 區間
+    """
+    df_use = df.tail(240).copy()
+    close = df_use["Close"].astype(float)
+
+    # log regression (deterministic)
+    y = np.log(close.values)
+    x = np.arange(len(y))
+
+    # 線性回歸（手寫）
+    x_mean = x.mean()
+    y_mean = y.mean()
+    slope = float(((x - x_mean) * (y - y_mean)).sum() / (((x - x_mean) ** 2).sum() + 1e-9))
+    intercept = float(y_mean - slope * x_mean)
+
+    # 殘差標準差
+    y_hat = intercept + slope * x
+    resid = y - y_hat
+    resid_std = float(np.std(resid)) if len(resid) > 5 else 0.02
+
+    # 95% 區間（粗略：±1.96*std）
+    z = 1.96
+
+    last_date = df_use.index[-1]
+    history = [
+        {"date": d.strftime("%Y-%m-%d"), "price": round(float(p), 2)}
+        for d, p in zip(df_use.index, close.values)
+    ]
+
+    pred = []
+    for i in range(1, future_days + 1):
+        xi = len(y) - 1 + i
+        yi = intercept + slope * xi
+        mid = float(np.exp(yi))
+        up = float(np.exp(yi + z * resid_std))
+        lo = float(np.exp(yi - z * resid_std))
+
+        next_date = last_date + datetime.timedelta(days=i)
+        pred.append({
+            "date": next_date.strftime("%Y-%m-%d"),
+            "mid": round(mid, 2),
+            "upper": round(up, 2),
+            "lower": round(lo, 2),
+        })
+
+    return {"history": history, "prediction": pred}
+
+
+# ==========================
+# 7) 真實新聞（可點擊、最新優先）
+# ==========================
+def parse_dt(entry: dict) -> Optional[datetime.datetime]:
+    # feedparser 的 published_parsed
+    if entry is None:
+        return None
+    if entry.get("published_parsed"):
+        try:
+            return datetime.datetime(*entry["published_parsed"][:6])
+        except Exception:
+            pass
+    # 有些 feed 是 published string
+    if entry.get("published"):
+        try:
+            return parsedate_to_datetime(entry["published"])
+        except Exception:
+            return None
+    return None
+
+
+def fetch_real_news(query: str, limit: int = 12) -> List[Dict[str, Any]]:
+    """
+    使用 Google News RSS（公開）聚合新聞。
+    注意：RSS 本身是公開資訊，可點擊跳轉原新聞。
+    """
+    if feedparser is None:
+        # 沒裝 feedparser 時，回空（前端會顯示錯誤訊息）
+        return []
+
+    # Google News RSS
+    # hl=zh-TW & gl=TW & ceid=TW:zh-Hant
+    q = query.strip()
+    rss_url = (
+        "https://news.google.com/rss/search?"
+        f"q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    )
+
+    feed = feedparser.parse(rss_url)
+    items = []
+    for e in feed.entries[:limit * 2]:
+        title = getattr(e, "title", "") or ""
+        link = getattr(e, "link", "") or ""
+        published = getattr(e, "published", "") or ""
+        dt = parse_dt(e) or None
+
+        # 推定分類：簡單用關鍵字
+        tag = "產業"
+        low = title.lower()
+        if any(k in low for k in ["風險", "戰", "地緣", "通膨", "升息", "降息", "fed", "利率", "油價"]):
+            tag = "風險"
+        if any(k in low for k in ["法說", "財報", "營收", "獲利", "eps", "目標價", "評等", "上調", "下調"]):
+            tag = "評論"
+
+        items.append({
+            "tag": tag,
+            "time": published or (dt.strftime("%Y-%m-%d %H:%M") if dt else ""),
+            "published_at": dt.isoformat() if dt else "",
+            "title": title,
+            "url": link,
+            "source": "Google News RSS",
+        })
+
+    # 去重（同連結）
+    seen = set()
+    uniq = []
+    for it in items:
+        u = it.get("url", "")
+        if not u:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        uniq.append(it)
+
+    # 最新優先
+    def sort_key(it):
+        ts = it.get("published_at") or ""
+        return ts
+
+    uniq.sort(key=sort_key, reverse=True)
+    return uniq[:limit]
+
+
+# ==========================
+# 8) 基本服務 / Debug
+# ==========================
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": APP_NAME, "time": datetime.datetime.utcnow().isoformat()}
+    return {
+        "service": APP_NAME,
+        "status": "ok",
+        "server_time_utc": datetime.datetime.utcnow().isoformat(),
+        "allowed_origins": ALLOWED_ORIGINS,
+    }
 
 
+@app.get("/debug/data_status")
+async def debug_data_status(symbol: str = Query("2330.TW"), limit_news: int = Query(8, ge=1, le=20)):
+    """
+    ✅ 用來「確認後端是否真的抓到資料」的驗證端點：
+    - 價格資料筆數
+    - 最新日期
+    - 新聞最新時間
+    """
+    t0 = time.time()
+    df = fetch_price_history(symbol, period="1y")
+    fetch_sec = round(time.time() - t0, 3)
+
+    if df.empty:
+        return {
+            "symbol": symbol,
+            "price_rows": 0,
+            "price_last_date": None,
+            "fetch_seconds": fetch_sec,
+            "news_count": 0,
+            "news_latest_time": None,
+            "sources": ["yfinance", "GoogleNewsRSS" if feedparser else "RSS_DISABLED(feedparser_missing)"],
+        }
+
+    last_date = df.index[-1].strftime("%Y-%m-%d")
+    news = fetch_real_news(symbol, limit=limit_news)
+    news_latest = news[0]["time"] if news else None
+
+    return {
+        "symbol": symbol,
+        "price_rows": int(len(df)),
+        "price_last_date": last_date,
+        "fetch_seconds": fetch_sec,
+        "news_count": len(news),
+        "news_latest_time": news_latest,
+        "sources": ["yfinance", "GoogleNewsRSS" if feedparser else "RSS_DISABLED(feedparser_missing)"],
+    }
+
+
+# ==========================
+# 9) Auth APIs
+# ==========================
 @app.post("/register")
-async def register(user: User):
+async def register(user: UserCreate):
     u = (user.username or "").strip()
-    p = user.password or ""
+    p = (user.password or "").strip()
 
-    validate_username(u)
-    validate_password(p)
+    # ✅ 註冊基本規則（你要求的）
+    if not USERNAME_RE.match(u):
+        raise HTTPException(status_code=400, detail="帳號規則：4–20碼，只允許英文/數字/底線")
+    if not PASSWORD_RE.match(p):
+        raise HTTPException(status_code=400, detail="密碼規則：至少8碼，需包含英文 + 數字")
 
     conn = get_db()
     c = conn.cursor()
 
-    # 檢查是否存在
-    c.execute("SELECT username FROM users WHERE username=?", (u,))
-    if c.fetchone():
+    try:
+        hashed = get_password_hash(p)
+        now = datetime.datetime.utcnow().isoformat()
+        c.execute(
+            "INSERT INTO users (username, hashed_password, created_at) VALUES (?, ?, ?)",
+            (u, hashed, now),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
         conn.close()
-        raise HTTPException(status_code=400, detail="此帳號已存在，請更換帳號")
+        raise HTTPException(status_code=409, detail="此帳號已被註冊")
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"註冊失敗：{str(e)}")
 
-    hashed_pw = get_password_hash(p)
-    now = datetime.datetime.utcnow().isoformat()
-
-    c.execute(
-        "INSERT INTO users (username, hashed_password, created_at) VALUES (?, ?, ?)",
-        (u, hashed_pw, now)
-    )
-    conn.commit()
     conn.close()
-
-    return {"message": "User created successfully"}
+    return {
+        "message": "註冊成功",
+        "store": {
+            "database": DATABASE_PATH,
+            "table": "users",
+            "fields": ["username", "hashed_password", "created_at"],
+            "note": "密碼不會明文保存，會以 bcrypt 雜湊保存。",
+        },
+    }
 
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    u = (form_data.username or "").strip()
-    p = form_data.password or ""
-
-    # 這裡不強制 validate_password（避免使用者舊密碼格式被擋），只驗證帳號格式
-    validate_username(u)
-
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT username, hashed_password FROM users WHERE username=?", (u,))
+
+    c.execute("SELECT * FROM users WHERE username = ?", (form_data.username,))
     row = c.fetchone()
     conn.close()
 
-    if (not row) or (not verify_password(p, row["hashed_password"])):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if not row or not verify_password(form_data.password, row["hashed_password"]):
+        raise HTTPException(status_code=401, detail="帳號或密碼錯誤")
 
-    access_token = create_access_token(data={"sub": row["username"]})
-    return {"access_token": access_token, "token_type": "bearer"}
+    token = create_access_token(subject=row["username"])
+    return {"access_token": token, "token_type": "bearer"}
 
 
-# -----------------------------
-# 真實新聞（可點擊連結）
-# - /api/news?symbol=2330.TW → 取該股新聞
-# - /api/news → 取全球新聞（用大盤/科技股作近似）
-# -----------------------------
+# ==========================
+# 10) News API（真實新聞可點擊，最新優先）
+# ==========================
 @app.get("/api/news")
-async def get_news(symbol: Optional[str] = Query(default=None, description="可選：股票代碼，例如 2330.TW")):
-    try:
-        if symbol:
-            t = yf.Ticker(symbol.strip())
-        else:
-            # global：用 ^GSPC 或 AAPL 取近似「全球市場快訊」
-            t = yf.Ticker("^GSPC")
-
-        items = t.news or []
-        out = []
-
-        for it in items[:20]:
-            # yfinance news 常見欄位：title, link, publisher, providerPublishTime
-            title = it.get("title") or ""
-            link = it.get("link") or it.get("url") or ""
-            publisher = it.get("publisher") or it.get("source") or "News"
-            ts = it.get("providerPublishTime") or int(time.time())
-            out.append({
-                "tag": "市場" if not symbol else "個股",
-                "time": time_ago(int(ts)),
-                "title": title,
-                "source": publisher,
-                "url": link
-            })
-
-        # 若抓不到資料，回傳空陣列（前端顯示「目前沒有新聞」）
-        return out
-    except Exception as e:
-        # 不要讓新聞壞掉拖垮整個頁面
+async def api_news(q: str = Query("全球市場 財經", description="可傳 symbol 或關鍵字"),
+                   limit: int = Query(10, ge=1, le=20)):
+    items = fetch_real_news(q, limit=limit)
+    if not items:
+        # 讓前端看到原因（例如缺 feedparser）
+        if feedparser is None:
+            raise HTTPException(status_code=500, detail="RSS 模組未啟用：缺少 feedparser 套件（下一步會在 requirements.txt 補上）")
         return []
+    return items
 
 
-# -----------------------------
-# 收藏（需登入）
-# -----------------------------
+# ==========================
+# 11) Analyze API（核心）
+# ==========================
+@app.post("/api/analyze")
+async def analyze_stock(request: AnalysisRequest):
+    t0 = time.time()
+    symbol = (request.symbol or "").strip()
+
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol 不可為空")
+
+    # 1) 抓行情
+    df = fetch_price_history(symbol, period="1y")
+    if df.empty:
+        raise HTTPException(status_code=404, detail="找不到此股票或沒有公開行情資料")
+
+    if len(df) < 80:
+        raise HTTPException(status_code=400, detail="資料筆數不足（至少需要約80個交易日）")
+
+    current_price = float(df["Close"].iloc[-1])
+    last_date = df.index[-1].strftime("%Y-%m-%d")
+
+    # 2) 四大面向評分（deterministic）
+    tech = score_technical(df)
+    fund = score_fundamental(symbol)
+    chip = score_chip_proxy(df)
+
+    # 3) 新聞（用 symbol 搜尋，最新優先）
+    news_items = fetch_real_news(symbol, limit=10)
+    news_score = score_news_sentiment(news_items)
+
+    overall = composite_score(tech["score"], fund["score"], chip["score"], news_score["score"])
+    senti = sentiment_text(overall)
+
+    # 4) 資金配置試算
+    principal = float(request.principal or 0)
+    if principal <= 0:
+        raise HTTPException(status_code=400, detail="本金 principal 必須大於 0")
+
+    max_shares = int(principal // current_price)
+    total_cost = float(max_shares * current_price)
+    remain_cash = float(principal - total_cost)
+    risk_loss_10 = float(total_cost * 0.10)
+
+    # 5) 波段價位
+    trade = band_trade_prices(current_price)
+
+    # 6) ROI 預估
+    roi = estimate_roi(total_cost, df)
+
+    # 7) 極端行情預警（60天）
+    risk = extreme_risk_95(total_cost, df, horizon_days=60)
+
+    # 8) 圖表資料（history + 預測區間帶）
+    chart = build_chart_data(df, future_days=60)
+
+    elapsed = round(time.time() - t0, 3)
+
+    return {
+        "symbol": symbol.upper(),
+        "data_status": {
+            "price_rows": int(len(df)),
+            "price_last_date": last_date,
+            "fetch_seconds": elapsed,
+            "sources": ["yfinance", "GoogleNewsRSS" if feedparser else "RSS_DISABLED(feedparser_missing)"],
+        },
+        "price": round(current_price, 2),
+
+        "ai_score": overall,
+        "ai_sentiment": senti,
+
+        "score_breakdown": {
+            "technical": tech,
+            "fundamental": fund,
+            "chip": chip,
+            "news": {**news_score, "news_count": len(news_items)},
+        },
+
+        "money_management": {
+            "principal": int(round(principal)),
+            "max_shares": max_shares,
+            "total_cost": int(round(total_cost)),
+            "remain_cash": int(round(remain_cash)),
+            "risk_loss_10_percent": int(round(risk_loss_10)),
+        },
+
+        "advice": trade,
+
+        "roi_estimates": roi,
+
+        "risk_analysis": risk,
+
+        "chart_data": chart,
+
+        # ✅ 讓前端顯示「最新新聞」但你之前說「個股新聞與AI觀點可刪」
+        # 這裡不強制回新聞內容；若你要在前端顯示可開啟：
+        # "news_items": news_items,
+    }
+
+
+# ==========================
+# 12) Favorites（需登入）
+# ==========================
 @app.get("/api/favorites")
-async def list_favorites(user: str = Depends(get_current_user)):
+async def get_favorites(user: str = Depends(get_current_user)):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT symbol, created_at FROM favorites WHERE username=? ORDER BY created_at DESC", (user,))
     rows = c.fetchall()
     conn.close()
-
     return [{"symbol": r["symbol"], "created_at": r["created_at"]} for r in rows]
 
 
-@app.post("/api/favorites/add")
-async def add_favorite(item: FavoriteItem, user: str = Depends(get_current_user)):
-    symbol = (item.symbol or "").strip().upper()
-    if not symbol:
+@app.post("/api/favorites")
+async def add_favorite(req: FavoriteReq, user: str = Depends(get_current_user)):
+    sym = (req.symbol or "").strip().upper()
+    if not sym:
         raise HTTPException(status_code=400, detail="symbol 不可為空")
 
     conn = get_db()
     c = conn.cursor()
     try:
         c.execute(
-            "INSERT INTO favorites (username, symbol, created_at) VALUES (?, ?, ?)",
-            (user, symbol, datetime.datetime.utcnow().isoformat())
+            "INSERT OR IGNORE INTO favorites (username, symbol, created_at) VALUES (?, ?, ?)",
+            (user, sym, datetime.datetime.utcnow().isoformat()),
         )
         conn.commit()
-    except sqlite3.IntegrityError:
-        # 已存在就視為成功（避免前端重按爆炸）
-        pass
     finally:
         conn.close()
+    return {"message": "ok", "symbol": sym}
 
-    return {"ok": True, "symbol": symbol}
 
-
-@app.post("/api/favorites/remove")
-async def remove_favorite(item: FavoriteItem, user: str = Depends(get_current_user)):
-    symbol = (item.symbol or "").strip().upper()
-    if not symbol:
-        raise HTTPException(status_code=400, detail="symbol 不可為空")
-
+@app.delete("/api/favorites")
+async def remove_favorite(symbol: str = Query(...), user: str = Depends(get_current_user)):
+    sym = (symbol or "").strip().upper()
     conn = get_db()
     c = conn.cursor()
-    c.execute("DELETE FROM favorites WHERE username=? AND symbol=?", (user, symbol))
+    c.execute("DELETE FROM favorites WHERE username=? AND symbol=?", (user, sym))
     conn.commit()
     conn.close()
+    return {"message": "ok", "symbol": sym}
 
-    return {"ok": True, "symbol": symbol}
 
-
-# -----------------------------
-# 模擬資產（需登入） - 保留你原本功能，但改成「會抓真實現價」更合理
-# -----------------------------
+# ==========================
+# 13) Portfolio（需登入）
+# ==========================
 @app.get("/api/portfolio")
 async def get_portfolio(user: str = Depends(get_current_user)):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM portfolio WHERE username=?", (user,))
+    c.execute("SELECT symbol, shares, avg_cost, created_at FROM portfolio WHERE username=? ORDER BY created_at DESC", (user,))
     rows = c.fetchall()
     conn.close()
 
     holdings = []
-    total_asset = 0.0
     total_cost = 0.0
+    total_value = 0.0
 
-    # 逐一抓現價（簡單版）
-    for row in rows:
-        symbol = row["symbol"]
-        shares = int(row["shares"])
-        avg_cost = float(row["avg_cost"])
-
-        current_price = avg_cost
-        try:
-            t = yf.Ticker(symbol)
-            df = t.history(period="5d")
-            if not df.empty:
-                current_price = float(df["Close"].iloc[-1])
-        except Exception:
-            pass
-
+    # 為了「真實資料」，這裡會抓現價（可能慢，但是真）
+    for r in rows:
+        sym = r["symbol"]
+        shares = int(r["shares"])
+        avg_cost = float(r["avg_cost"])
+        df = fetch_price_history(sym, period="3mo")
+        cur = float(df["Close"].iloc[-1]) if not df.empty else avg_cost
+        mv = shares * cur
         cost = shares * avg_cost
-        value = shares * current_price
-        pnl = value - cost
 
         holdings.append({
-            "symbol": symbol,
+            "symbol": sym,
             "shares": shares,
-            "cost": round(avg_cost, 2),
-            "current_price": round(current_price, 2),
-            "market_value": round(value, 0),
-            "pnl": round(pnl, 0),
+            "avg_cost": round(avg_cost, 2),
+            "current_price": round(cur, 2),
+            "market_value": int(round(mv)),
+            "pnl": int(round(mv - cost)),
+            "created_at": r["created_at"],
         })
-
-        total_asset += value
         total_cost += cost
+        total_value += mv
 
     return {
-        "total_asset": round(total_asset, 0),
-        "total_cost": round(total_cost, 0),
-        "unrealized_pnl": round(total_asset - total_cost, 0),
-        "holdings": holdings
+        "total_asset": int(round(total_value)),
+        "total_cost": int(round(total_cost)),
+        "unrealized_pnl": int(round(total_value - total_cost)),
+        "holdings": holdings,
     }
 
 
 @app.post("/api/portfolio/add")
 async def add_to_portfolio(item: PortfolioItem, user: str = Depends(get_current_user)):
-    symbol = (item.symbol or "").strip().upper()
-    if not symbol:
+    sym = (item.symbol or "").strip().upper()
+    if not sym:
         raise HTTPException(status_code=400, detail="symbol 不可為空")
     if item.shares <= 0:
-        raise HTTPException(status_code=400, detail="shares 必須大於 0")
+        raise HTTPException(status_code=400, detail="shares 必須 > 0")
     if item.cost <= 0:
-        raise HTTPException(status_code=400, detail="cost 必須大於 0")
+        raise HTTPException(status_code=400, detail="cost 必須 > 0")
 
     conn = get_db()
     c = conn.cursor()
     c.execute(
         "INSERT INTO portfolio (username, symbol, shares, avg_cost, created_at) VALUES (?, ?, ?, ?, ?)",
-        (user, symbol, int(item.shares), float(item.cost), datetime.datetime.utcnow().isoformat())
+        (user, sym, int(item.shares), float(item.cost), datetime.datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
+    return {"message": "Added to portfolio", "symbol": sym}
 
-    return {"message": "Added to portfolio"}
+
+# ==========================
+# 14) K 線詳細分析（需登入，先提供基礎版本）
+# ==========================
+def detect_candle_patterns(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    提供部分常見型態偵測（不假裝全48型態都精準判定，先打底）
+    後續可逐步擴充到 48 型態。
+    """
+    if len(df) < 5:
+        return {"patterns": [], "note": "資料不足"}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    o, h, l, c = float(last["Open"]), float(last["High"]), float(last["Low"]), float(last["Close"])
+    o2, c2 = float(prev["Open"]), float(prev["Close"])
+
+    body = abs(c - o)
+    rng = max(1e-9, h - l)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    patterns = []
+
+    # Doji
+    if body / rng < 0.1:
+        patterns.append("十字線 Doji")
+
+    # Hammer / Hanging man（簡化：下影線長、實體小）
+    if lower / rng > 0.55 and body / rng < 0.25:
+        patterns.append("錘子線 Hammer（需搭配趨勢判讀）")
+
+    # Engulfing
+    # 多方吞噬：前一根黑、這根紅且實體包住
+    if (c2 < o2) and (c > o) and (c >= o2) and (o <= c2):
+        patterns.append("多方吞噬 Bullish Engulfing")
+    # 空方吞噬：前一根紅、這根黑且實體包住
+    if (c2 > o2) and (c < o) and (o >= c2) and (c <= o2):
+        patterns.append("空方吞噬 Bearish Engulfing")
+
+    return {
+        "patterns": patterns,
+        "candle": {
+            "body": round(body, 4),
+            "range": round(rng, 4),
+            "upper_shadow": round(upper, 4),
+            "lower_shadow": round(lower, 4),
+        },
+        "note": "此為基礎型態偵測，後續可擴充到 48 種型態完整判別。",
+    }
 
 
-# -----------------------------
-# 核心分析（/api/analyze）
-# - 回傳：AI 綜合評分 + ROI + 波段價位 + 極端行情預警 + 圖表資料
-# -----------------------------
-@app.post("/api/analyze")
-async def analyze_stock(request: AnalysisRequest):
-    symbol = (request.symbol or "").strip()
-    if not symbol:
-        raise HTTPException(status_code=400, detail="symbol 不可為空")
-    if request.principal <= 0:
-        raise HTTPException(status_code=400, detail="principal 必須大於 0")
+@app.get("/api/kline/detail")
+async def kline_detail(
+    symbol: str = Query(...),
+    interval: str = Query("1d", description="1d/1wk/1mo"),
+    lookback: int = Query(200, ge=60, le=800),
+    user: str = Depends(get_current_user),
+):
+    """
+    ✅ 需要登入才能使用（你要求的）
+    回傳：
+    - K 線型態（基礎）
+    - 時間週期
+    - 量能
+    - 技術指標（MA/MACD/RSI/KD/布林）
+    """
+    # yfinance interval: 1d, 1wk, 1mo
+    df = yf.download(symbol, period="2y", interval=interval, auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        raise HTTPException(status_code=404, detail="找不到此股票K線資料")
 
-    # 取 2 年資料：更穩
-    try:
-        t = yf.Ticker(symbol)
-        df = t.history(period="2y", auto_adjust=False)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"抓取股價資料失敗：{str(e)}")
+    df = df.dropna(subset=["Close"])
+    df = df.tail(lookback)
 
-    if df is None or df.empty or len(df) < 80:
-        raise HTTPException(status_code=400, detail="資料不足（至少需要約 80 個交易日資料）")
+    tech = score_technical(df)
+    patterns = detect_candle_patterns(df)
 
-    # 技術指標 / 評分
-    tech_score = float(score_technical(df))
-    # 新聞（可用於消息面分數）
-    news_items = []
-    try:
-        items = (t.news or [])[:20]
-        for it in items:
-            news_items.append(it)
-    except Exception:
-        news_items = []
-
-    fund_score = float(score_fundamental_placeholder(symbol))
-    chip_score = float(score_chip_placeholder(df))
-    news_score = float(score_news_placeholder(news_items))
-
-    # 綜合評分（四大面向加總平均，確保可重現）
-    ai_score = round((tech_score + fund_score + chip_score + news_score) / 4.0, 0)
-
-    if ai_score >= 80:
-        sentiment = "強力看多"
-    elif ai_score >= 60:
-        sentiment = "偏多"
-    elif ai_score >= 40:
-        sentiment = "中立"
-    else:
-        sentiment = "偏空"
-
-    close = df["Close"].copy()
-    current_price = float(close.iloc[-1])
-
-    # 資金配置
-    max_shares = int(request.principal // current_price)
-    total_cost = float(max_shares * current_price)
-    risk_loss_10 = float(total_cost * 0.10)
-
-    # 波段價位（先用現價作買入，停利停損固定比例；後續可改用 ATR/支撐壓力）
-    buy_price = current_price
-    take_profit = round(buy_price * 1.20, 2)
-    stop_loss = round(buy_price * 0.90, 2)
-
-    # ROI 估算（用真實歷史報酬）
-    roi = calc_roi_estimates(total_cost, close)
-
-    # 極端行情預警（60 天）
-    var_pack = calc_var95(close, horizon_days=60)
-    max_loss_amt = round(total_cost * abs(var_pack["var_h_pct"]) / 100.0, 0)
-
-    # 圖表資料：回最近 120 天
-    hist_days = 120
-    hist_df = df.tail(hist_days)
-    history = []
-    for idx, row in hist_df.iterrows():
-        history.append({
-            "date": idx.strftime("%Y-%m-%d"),
-            "open": round(float(row["Open"]), 2),
-            "high": round(float(row["High"]), 2),
-            "low": round(float(row["Low"]), 2),
-            "close": round(float(row["Close"]), 2),
-            "volume": int(row["Volume"]) if not pd.isna(row["Volume"]) else 0
-        })
+    # 量能（近5 vs 近20）
+    vol = df["Volume"].fillna(0)
+    v5 = float(vol.tail(5).mean())
+    v20 = float(vol.tail(20).mean())
+    vol_ratio = (v5 / v20) if v20 > 0 else 1.0
 
     return {
         "symbol": symbol.upper(),
-        "price": round(current_price, 2),
-
-        # 核心分數
-        "ai_score": int(ai_score),
-        "ai_sentiment": sentiment,
-
-        # 四大面向（前端可直接顯示）
-        "score_breakdown": {
-            "technical": int(round(tech_score, 0)),
-            "fundamental": int(round(fund_score, 0)),
-            "chip": int(round(chip_score, 0)),
-            "news": int(round(news_score, 0)),
-        },
-
-        # 資金配置試算
-        "money_management": {
-            "principal": float(request.principal),
-            "max_shares": max_shares,
-            "total_cost": round(total_cost, 2),
-            "risk_loss_10_percent": round(risk_loss_10, 2),
-        },
-
-        # 波段建議
-        "advice": {
-            "buy_price": round(buy_price, 2),
-            "take_profit": take_profit,
-            "stop_loss": stop_loss,
-        },
-
-        # ROI 預估（四個期限）
-        "roi_estimates": {
-            "day": roi["day"],
-            "short": roi["short"],
-            "mid": roi["mid"],
-            "long": roi["long"],
-        },
-
-        # 風險（極端行情預警）
-        "risk_analysis": {
-            "max_loss_pct_60d": var_pack["var_h_pct"],
-            "max_loss_amt_60d": float(max_loss_amt),
-            "pessimistic_price_60d": var_pack["pessimistic_price"],
-            "confidence_level": "95%",
-        },
-
-        # 圖表資料（K線用）
-        "chart_data": {
-            "history": history
-        }
-    }
-
-
-# -----------------------------
-# K 線詳細分析（需登入）
-# - 支援 timeframe：1d, 1wk, 1mo, 1h, 30m, 15m, 5m...
-# -----------------------------
-@app.get("/api/kline-detail")
-async def kline_detail(
-    symbol: str = Query(..., description="股票代碼，例如 2330.TW"),
-    interval: str = Query("1d", description="時間週期：1d/1wk/1mo/1h/30m/15m/5m..."),
-    period: str = Query("6mo", description="回溯期間：1mo/3mo/6mo/1y/2y...（分K建議用較短）"),
-    user: str = Depends(get_current_user),
-):
-    s = (symbol or "").strip()
-    if not s:
-        raise HTTPException(status_code=400, detail="symbol 不可為空")
-
-    try:
-        t = yf.Ticker(s)
-        df = t.history(period=period, interval=interval, auto_adjust=False)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"抓取K線資料失敗：{str(e)}")
-
-    if df is None or df.empty or len(df) < 50:
-        raise HTTPException(status_code=400, detail="K線資料不足（請換更長 period 或更大 interval）")
-
-    df = df.dropna()
-    close = df["Close"]
-
-    # 技術指標
-    rsi_series = calc_rsi(close)
-    macd_pack = calc_macd(close)
-    kd_pack = calc_kd(df)
-    bb = calc_bollinger(close)
-
-    ma5 = close.rolling(5).mean()
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean() if len(df) >= 60 else close.rolling(20).mean()
-
-    # 量能分析
-    vol = df["Volume"] if "Volume" in df.columns else pd.Series([0] * len(df), index=df.index)
-    vol5 = vol.rolling(5).mean()
-    vol20 = vol.rolling(20).mean()
-
-    # K線形態偵測（先做常用）
-    patterns = detect_basic_candle_patterns(df)
-
-    # 組合資料給前端
-    tail_n = 120 if interval in ["1d", "1wk", "1mo"] else 200
-    dft = df.tail(tail_n)
-
-    candles = []
-    for idx, row in dft.iterrows():
-        candles.append({
-            "t": idx.isoformat(),
-            "open": round(float(row["Open"]), 4),
-            "high": round(float(row["High"]), 4),
-            "low": round(float(row["Low"]), 4),
-            "close": round(float(row["Close"]), 4),
-            "volume": int(row["Volume"]) if not pd.isna(row["Volume"]) else 0,
-        })
-
-    indicators = {
-        "ma5": round(float(ma5.iloc[-1]), 4) if not pd.isna(ma5.iloc[-1]) else None,
-        "ma20": round(float(ma20.iloc[-1]), 4) if not pd.isna(ma20.iloc[-1]) else None,
-        "ma60": round(float(ma60.iloc[-1]), 4) if not pd.isna(ma60.iloc[-1]) else None,
-
-        "rsi14": round(float(rsi_series.iloc[-1]), 2),
-
-        "macd": round(float(macd_pack["macd"].iloc[-1]), 4),
-        "macd_signal": round(float(macd_pack["signal"].iloc[-1]), 4),
-        "macd_hist": round(float(macd_pack["hist"].iloc[-1]), 4),
-
-        "k": round(float(kd_pack["k"].iloc[-1]), 2),
-        "d": round(float(kd_pack["d"].iloc[-1]), 2),
-
-        "bb_mid": round(float(bb["mid"].iloc[-1]), 4) if not pd.isna(bb["mid"].iloc[-1]) else None,
-        "bb_upper": round(float(bb["upper"].iloc[-1]), 4) if not pd.isna(bb["upper"].iloc[-1]) else None,
-        "bb_lower": round(float(bb["lower"].iloc[-1]), 4) if not pd.isna(bb["lower"].iloc[-1]) else None,
-
-        "vol5_avg": round(float(vol5.iloc[-1]), 2) if not pd.isna(vol5.iloc[-1]) else None,
-        "vol20_avg": round(float(vol20.iloc[-1]), 2) if not pd.isna(vol20.iloc[-1]) else None,
-    }
-
-    # 給一段「判讀摘要」（可重現）
-    summary = []
-    if indicators["ma5"] and indicators["ma20"] and indicators["ma60"]:
-        if indicators["ma5"] > indicators["ma20"] > indicators["ma60"]:
-            summary.append("均線呈多頭排列（MA5 > MA20 > MA60），趨勢偏多。")
-        elif indicators["ma5"] < indicators["ma20"] < indicators["ma60"]:
-            summary.append("均線呈空頭排列（MA5 < MA20 < MA60），趨勢偏空。")
-        else:
-            summary.append("均線未形成明顯排列，趨勢可能盤整或轉折中。")
-
-    if indicators["rsi14"] >= 70:
-        summary.append("RSI 進入超買區（>=70），需留意拉回風險。")
-    elif indicators["rsi14"] <= 30:
-        summary.append("RSI 進入超賣區（<=30），可能出現反彈。")
-    else:
-        summary.append("RSI 落在中性區間，動能較均衡。")
-
-    if indicators["macd_hist"] > 0:
-        summary.append("MACD 柱狀體為正，動能偏多。")
-    else:
-        summary.append("MACD 柱狀體為負，動能偏弱。")
-
-    if indicators["vol5_avg"] and indicators["vol20_avg"]:
-        if indicators["vol5_avg"] > indicators["vol20_avg"] * 1.2:
-            summary.append("近5期均量明顯大於20期均量，量能放大。")
-        elif indicators["vol5_avg"] < indicators["vol20_avg"] * 0.8:
-            summary.append("近5期均量低於20期均量，量能偏縮。")
-
-    return {
-        "symbol": s.upper(),
         "interval": interval,
-        "period": period,
-        "candles": candles,
-        "indicators": indicators,
-        "detected_patterns": patterns,
-        "pattern_catalog_48": CANDLE_PATTERN_48,
-        "summary": summary
+        "lookback": lookback,
+        "last_date": df.index[-1].strftime("%Y-%m-%d"),
+        "volume": {
+            "v5": int(round(v5)),
+            "v20": int(round(v20)),
+            "ratio_5v20": round(vol_ratio, 4),
+        },
+        "technical": tech,
+        "patterns": patterns,
+        "hint": {
+            "48_patterns": "你要求的48種型態可逐步擴充；目前先上常見核心型態+指標整合。",
+        },
+        "access": {"user": user, "auth_required": True},
     }
 
 
-# -----------------------------
-# 本機啟動
-# -----------------------------
+# ==========================
+# 15) 啟動
+# ==========================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
