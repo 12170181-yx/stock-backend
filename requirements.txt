@@ -1,11 +1,10 @@
 fastapi
-uvicorn[standard]
-python-multipart
-
+uvicorn
 yfinance
 pandas
 numpy
-scikit-learn
+python-multipart
 
 passlib[bcrypt]
 python-jose[cryptography]
+feedparser
