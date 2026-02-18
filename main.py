@@ -29,17 +29,17 @@ APP_NAME = "stock-backend"
 # Render / 本機環境變數
 DATABASE_PATH = os.getenv("DATABASE_PATH", "stock_app.db")
 
-# 你前端的正式網址
+# 你前端的正式網址 (允許本地與生產環境)
 VERCEL_FRONTEND = os.getenv("VERCEL_FRONTEND", "https://stock-frontend-theta.vercel.app")
 
-# CORS
-ALLOWED_ORIGINS = list({
+# CORS 設定
+ALLOWED_ORIGINS = [
     VERCEL_FRONTEND,
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-})
+]
 
 app = FastAPI(title=APP_NAME)
 
@@ -53,7 +53,7 @@ app.add_middleware(
 
 
 # ==========================
-# 1) DB 初始化 (移除 Users 表)
+# 1) DB 初始化
 # ==========================
 def get_db():
     conn = sqlite3.connect(DATABASE_PATH)
@@ -64,8 +64,6 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
-
-    # 移除 Users 表建立邏輯
 
     c.execute(
         """
@@ -100,7 +98,7 @@ init_db()
 
 
 # ==========================
-# 2) Pydantic Models (移除 UserCreate, Token)
+# 2) Pydantic Models
 # ==========================
 class AnalysisRequest(BaseModel):
     symbol: str
@@ -126,15 +124,23 @@ def fetch_price_history(symbol: str, period: str = "1y") -> pd.DataFrame:
     """
     使用 yfinance 抓取公開行情資料。
     """
-    # download 較穩定
-    df = yf.download(symbol, period=period, interval="1d", auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
+    try:
+        # download 較穩定
+        df = yf.download(symbol, period=period, interval="1d", auto_adjust=False, progress=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
 
-    # 清理
-    df = df.dropna(subset=["Close"])
-    df.index = pd.to_datetime(df.index)
-    return df
+        # yfinance 新版回傳可能是 MultiIndex，簡單處理
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # 清理
+        df = df.dropna(subset=["Close"])
+        df.index = pd.to_datetime(df.index)
+        return df
+    except Exception as e:
+        print(f"Error fetching data for {symbol}: {e}")
+        return pd.DataFrame()
 
 
 def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
@@ -263,7 +269,9 @@ def score_fundamental(symbol: str) -> Dict[str, Any]:
     s = 50.0
     info = {}
     try:
-        info = yf.Ticker(symbol).info or {}
+        # yfinance 取得基本面
+        ticker = yf.Ticker(symbol)
+        info = ticker.info or {}
     except Exception:
         info = {}
 
@@ -329,7 +337,9 @@ def score_chip_proxy(df: pd.DataFrame) -> Dict[str, Any]:
     if len(y) >= 10:
         x_mean = x.mean()
         y_mean = y.mean()
-        slope = float(((x - x_mean) * (y - y_mean)).sum() / (((x - x_mean) ** 2).sum() + 1e-9))
+        den = ((x - x_mean) ** 2).sum()
+        if den == 0: den = 1e-9
+        slope = float(((x - x_mean) * (y - y_mean)).sum() / den)
 
     v5 = float(vol.tail(5).mean())
     v20 = float(vol.tail(20).mean())
@@ -450,12 +460,15 @@ def build_chart_data(df: pd.DataFrame, future_days: int = 30) -> Dict[str, Any]:
     df_use = df.tail(240).copy()
     close = df_use["Close"].astype(float)
 
+    # 簡單線性回歸預測 (Log space)
     y = np.log(close.values)
     x = np.arange(len(y))
 
     x_mean = x.mean()
     y_mean = y.mean()
-    slope = float(((x - x_mean) * (y - y_mean)).sum() / (((x - x_mean) ** 2).sum() + 1e-9))
+    den = ((x - x_mean) ** 2).sum()
+    if den == 0: den = 1e-9
+    slope = float(((x - x_mean) * (y - y_mean)).sum() / den)
     intercept = float(y_mean - slope * x_mean)
 
     y_hat = intercept + slope * x
@@ -511,6 +524,7 @@ def fetch_real_news(query: str, limit: int = 12) -> List[Dict[str, Any]]:
         return []
 
     q = query.strip()
+    # Google News RSS (台灣繁體中文)
     rss_url = (
         "https://news.google.com/rss/search?"
         f"q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
@@ -540,6 +554,7 @@ def fetch_real_news(query: str, limit: int = 12) -> List[Dict[str, Any]]:
             "source": "Google News RSS",
         })
 
+    # 去重
     seen = set()
     uniq = []
     for it in items:
@@ -609,7 +624,8 @@ async def api_news(q: str = Query("全球市場 財經", description="可傳 sym
                    limit: int = Query(10, ge=1, le=20)):
     items = fetch_real_news(q, limit=limit)
     if not items and feedparser is None:
-        raise HTTPException(status_code=500, detail="RSS 模組未啟用：缺少 feedparser 套件")
+        # 如果沒裝 feedparser，回傳空列表，不報錯
+        return []
     return items
 
 
@@ -628,8 +644,8 @@ async def analyze_stock(request: AnalysisRequest):
     if df.empty:
         raise HTTPException(status_code=404, detail="找不到此股票或沒有公開行情資料")
 
-    if len(df) < 80:
-        raise HTTPException(status_code=400, detail="資料筆數不足（至少需要約80個交易日）")
+    if len(df) < 60:
+        raise HTTPException(status_code=400, detail="資料筆數不足（至少需要約60個交易日）")
 
     current_price = float(df["Close"].iloc[-1])
     last_date = df.index[-1].strftime("%Y-%m-%d")
@@ -757,8 +773,14 @@ async def get_portfolio():
         sym = r["symbol"]
         shares = int(r["shares"])
         avg_cost = float(r["avg_cost"])
-        df = fetch_price_history(sym, period="3mo")
-        cur = float(df["Close"].iloc[-1]) if not df.empty else avg_cost
+        
+        # 抓取目前股價
+        try:
+            df = fetch_price_history(sym, period="5d")
+            cur = float(df["Close"].iloc[-1]) if not df.empty else avg_cost
+        except:
+            cur = avg_cost
+            
         mv = shares * cur
         cost = shares * avg_cost
 
@@ -856,38 +878,45 @@ async def kline_detail(
     # 公開，不驗證 user
     user = "guest"
 
-    df = yf.download(symbol, period="2y", interval=interval, auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        raise HTTPException(status_code=404, detail="找不到此股票K線資料")
+    try:
+        df = yf.download(symbol, period="2y", interval=interval, auto_adjust=False, progress=False)
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail="找不到此股票K線資料")
 
-    df = df.dropna(subset=["Close"])
-    df = df.tail(lookback)
+        # Handle MultiIndex for recent yfinance versions
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-    tech = score_technical(df)
-    patterns = detect_candle_patterns(df)
+        df = df.dropna(subset=["Close"])
+        df = df.tail(lookback)
 
-    vol = df["Volume"].fillna(0)
-    v5 = float(vol.tail(5).mean())
-    v20 = float(vol.tail(20).mean())
-    vol_ratio = (v5 / v20) if v20 > 0 else 1.0
+        tech = score_technical(df)
+        patterns = detect_candle_patterns(df)
 
-    return {
-        "symbol": symbol.upper(),
-        "interval": interval,
-        "lookback": lookback,
-        "last_date": df.index[-1].strftime("%Y-%m-%d"),
-        "volume": {
-            "v5": int(round(v5)),
-            "v20": int(round(v20)),
-            "ratio_5v20": round(vol_ratio, 4),
-        },
-        "technical": tech,
-        "patterns": patterns,
-        "hint": {
-            "48_patterns": "你要求的48種型態可逐步擴充；目前先上常見核心型態+指標整合。",
-        },
-        "access": {"user": user, "auth_required": False},
-    }
+        vol = df["Volume"].fillna(0)
+        v5 = float(vol.tail(5).mean())
+        v20 = float(vol.tail(20).mean())
+        vol_ratio = (v5 / v20) if v20 > 0 else 1.0
+
+        return {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "lookback": lookback,
+            "last_date": df.index[-1].strftime("%Y-%m-%d"),
+            "volume": {
+                "v5": int(round(v5)),
+                "v20": int(round(v20)),
+                "ratio_5v20": round(vol_ratio, 4),
+            },
+            "technical": tech,
+            "patterns": patterns,
+            "hint": {
+                "48_patterns": "你要求的48種型態可逐步擴充；目前先上常見核心型態+指標整合。",
+            },
+            "access": {"user": user, "auth_required": False},
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"K線分析錯誤: {str(e)}")
 
 
 # ==========================
