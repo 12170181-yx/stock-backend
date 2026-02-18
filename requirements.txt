@@ -3,8 +3,4 @@ uvicorn
 yfinance
 pandas
 numpy
-python-multipart
-
-passlib[bcrypt]
-python-jose[cryptography]
 feedparser
