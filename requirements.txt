@@ -1,8 +1,9 @@
 fastapi
 uvicorn
 yfinance
-pandas
+pandas>=2.0.0
 numpy
 feedparser
 pydantic
 requests
+lxml
