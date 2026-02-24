@@ -149,7 +149,8 @@ def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
     loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
     rs = gain / loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="bfill").fillna(50)
+# 將 fillna(method="bfill") 改為直接調用 bfill()
+return rsi.bfill().fillna(50)
 
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
