@@ -22,7 +22,7 @@ APP_NAME = "stock-backend-quant-pro"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "stock_app.db")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-# 🚀 讀取你在 Render 設定的 API Key (若沒抓到則預設為 demo，demo 僅限查 AAPL)
+# 🚀 讀取你在 Render 設定的 FMP API Key
 FMP_API_KEY = os.getenv("FMP_API_KEY", "demo")
 
 # ==========================
@@ -32,9 +32,9 @@ PRICE_CACHE: Dict[str, Tuple[pd.DataFrame, float]] = {}
 FUND_CACHE: Dict[str, Tuple[Dict[str, Any], float]] = {}
 NEWS_CACHE: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
 
-PRICE_CACHE_TTL = 600      # 股價快取 10 分鐘
-FUND_CACHE_TTL = 86400     # 基本面快取 1 天
-NEWS_CACHE_TTL = 3600      # 新聞快取 1 小時
+PRICE_CACHE_TTL = 600      
+FUND_CACHE_TTL = 86400     
+NEWS_CACHE_TTL = 3600      
 
 # ==========================
 # ⚙️ FastAPI 初始化 & DB
@@ -73,7 +73,7 @@ class AnalysisRequest(BaseModel):
     duration: str
 
 # ==========================
-# 📰 外部新聞抓取模組 (非同步 + 快取)
+# 📰 外部新聞抓取模組
 # ==========================
 def parse_dt(entry: dict) -> Optional[datetime.datetime]:
     if entry.get("published_parsed"):
@@ -130,7 +130,7 @@ async def get_news(q: str = Query("全球市場 財經"), limit: int = Query(10,
     return data
 
 # ==========================
-# 📊 核心：海量指標計算引擎 (pandas-ta)
+# 📊 核心：海量指標計算引擎
 # ==========================
 def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ret"] = df["Close"].pct_change()
@@ -148,7 +148,19 @@ def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9"])
 
 # ==========================
-# 📡 抓取金融資料模組 (🚀 改用正規 FMP API)
+# 🔀 智慧路由：判斷台股或美股
+# ==========================
+def is_taiwan_stock(symbol: str) -> bool:
+    # 如果代碼是純數字，或者帶有 .TW / .TWO，判定為台股
+    clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
+    return clean_symbol.isdigit()
+
+def clean_tw_symbol(symbol: str) -> str:
+    # 將 2330.TW 轉為純數字 2330 供 FinMind 查詢
+    return symbol.replace(".TW", "").replace(".TWO", "")
+
+# ==========================
+# 📡 抓取金融資料模組 (台美雙引擎)
 # ==========================
 async def fetch_price_history(symbol: str) -> pd.DataFrame:
     now = time.time()
@@ -157,28 +169,38 @@ async def fetch_price_history(symbol: str) -> pd.DataFrame:
         if now - ts < PRICE_CACHE_TTL: return df
 
     def _download():
-        # 呼叫 FMP 歷史股價 API (抓取過去 500 個交易日)
-        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=500&apikey={FMP_API_KEY}"
-        resp = requests.get(url)
-        if resp.status_code != 200: return pd.DataFrame()
-        
-        data = resp.json()
-        if "historical" not in data: return pd.DataFrame()
-        
-        # 轉換成 pandas DataFrame
-        df = pd.DataFrame(data["historical"])
-        
-        # FMP 的資料是最新的在最前面，我們需要將它反轉 (舊 -> 新) 才能正確計算技術指標
-        df = df.iloc[::-1].reset_index(drop=True)
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        
-        # 欄位首字母大寫，以符合 pandas-ta 的格式
-        df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+        if is_taiwan_stock(symbol):
+            # 🇹🇼 走 FinMind 通道 (台股)
+            tw_id = clean_tw_symbol(symbol)
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=700)).strftime("%Y-%m-%d")
+            url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={tw_id}&start_date={start_date}"
+            resp = requests.get(url)
+            if resp.status_code != 200: return pd.DataFrame()
+            data = resp.json()
+            if "data" not in data or not data["data"]: return pd.DataFrame()
+            
+            df = pd.DataFrame(data["data"])
+            # FinMind 的欄位名稱轉為標準格式
+            df.rename(columns={"open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"}, inplace=True)
+            df["date"] = pd.to_datetime(df["date"])
+            df.set_index("date", inplace=True)
+            
+        else:
+            # 🇺🇸 走 FMP 通道 (美股)
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=500&apikey={FMP_API_KEY}"
+            resp = requests.get(url)
+            if resp.status_code != 200: return pd.DataFrame()
+            data = resp.json()
+            if "historical" not in data: return pd.DataFrame()
+            
+            df = pd.DataFrame(data["historical"])
+            df = df.iloc[::-1].reset_index(drop=True)
+            df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+            df["date"] = pd.to_datetime(df["date"])
+            df.set_index("date", inplace=True)
+
         df = df.dropna(subset=["Close", "Volume"])
-        
-        if len(df) < 30: return pd.DataFrame() # 資料太少無法算均線
-        
+        if len(df) < 30: return pd.DataFrame()
         return enrich_indicators(df)
 
     df = await run_in_threadpool(_download)
@@ -192,14 +214,25 @@ async def fetch_fundamental(symbol: str) -> Dict[str, float]:
         if now - ts < FUND_CACHE_TTL: return data
 
     def _fetch():
-        # 呼叫 FMP 即時報價 API 來取得 PE 本益比
-        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
-        resp = requests.get(url)
-        if resp.status_code == 200 and len(resp.json()) > 0:
-            info = resp.json()[0]
-            pe = info.get("pe")
-            return {"pe_ratio": pe if pe is not None else 15}
-        return {"pe_ratio": 15}
+        if is_taiwan_stock(symbol):
+            # 🇹🇼 台股本益比 (FinMind)
+            tw_id = clean_tw_symbol(symbol)
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+            url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPER&data_id={tw_id}&start_date={start_date}"
+            resp = requests.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "data" in data and len(data["data"]) > 0:
+                    return {"pe_ratio": data["data"][-1].get("PER", 15)}
+            return {"pe_ratio": 15}
+        else:
+            # 🇺🇸 美股本益比 (FMP)
+            url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
+            resp = requests.get(url)
+            if resp.status_code == 200 and len(resp.json()) > 0:
+                pe = resp.json()[0].get("pe")
+                return {"pe_ratio": pe if pe is not None else 15}
+            return {"pe_ratio": 15}
 
     try: data = await run_in_threadpool(_fetch)
     except Exception: data = {"pe_ratio": 15}
