@@ -1,9 +1,18 @@
+# --- Web 框架與非同步伺服器 ---
 fastapi
 uvicorn
-yfinance
+pydantic
+
+# --- 量化與資料處理核心 ---
 pandas>=2.0.0
 numpy
-feedparser
-pydantic
+yfinance
+pandas-ta    # 🚀 新增：最強大的技術指標計算引擎
+
+# --- 資料庫 ---
+aiosqlite    # 🚀 新增：非同步 SQLite，解決高併發鎖死問題
+
+# --- 網路請求與解析 (用於新聞與爬蟲) ---
 requests
+feedparser
 lxml
