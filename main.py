@@ -6,9 +6,9 @@ import urllib.parse
 import numpy as np
 import pandas as pd
 import pandas_ta as ta  # 🚀 最強大的技術指標庫
-import yfinance as yf
 import aiosqlite
 import feedparser       # 新聞 RSS 解析
+import requests         # API 請求套件
 
 from typing import Dict, Any, Tuple, List, Optional
 from email.utils import parsedate_to_datetime
@@ -21,6 +21,9 @@ from pydantic import BaseModel
 APP_NAME = "stock-backend-quant-pro"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "stock_app.db")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
+# 🚀 讀取你在 Render 設定的 API Key (若沒抓到則預設為 demo，demo 僅限查 AAPL)
+FMP_API_KEY = os.getenv("FMP_API_KEY", "demo")
 
 # ==========================
 # 🗄️ 全域快取系統 (Cache)
@@ -58,7 +61,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, 
-    allow_origins=["*"],  # 🚀 直接寫死允許所有來源，避免 CORS 誤判掩蓋真實錯誤
+    allow_origins=["*"],  
     allow_credentials=True, 
     allow_methods=["*"], 
     allow_headers=["*"],
@@ -82,22 +85,15 @@ def parse_dt(entry: dict) -> Optional[datetime.datetime]:
     return None
 
 def _fetch_rss_sync(query: str, limit: int) -> List[Dict[str, Any]]:
-    """在背景執行緒跑的同步抓取邏輯"""
     safe_query = urllib.parse.quote(query.strip())
     rss_url = f"https://news.google.com/rss/search?q={safe_query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-    
-    try:
-        feed = feedparser.parse(rss_url)
-    except Exception as e:
-        print(f"RSS Fetch Error: {e}")
-        return []
+    try: feed = feedparser.parse(rss_url)
+    except Exception: return []
 
     items = []
     for e in feed.entries[:limit * 2]:
         dt = parse_dt(e)
         title = getattr(e, "title", "")
-        
-        # 簡易 NLP 標籤分類
         tag = "產業"
         low_title = title.lower()
         if any(k in low_title for k in ["風險", "戰", "通膨", "升息", "fed", "跌", "警告"]): tag = "風險"
@@ -112,7 +108,6 @@ def _fetch_rss_sync(query: str, limit: int) -> List[Dict[str, Any]]:
             "source": getattr(e, "source", {}).get("title", "Google News") if hasattr(e, "source") else "Google News"
         })
         
-    # 去重與排序
     seen = set()
     uniq = []
     for it in items:
@@ -127,20 +122,11 @@ def _fetch_rss_sync(query: str, limit: int) -> List[Dict[str, Any]]:
 async def get_news(q: str = Query("全球市場 財經"), limit: int = Query(10, ge=1, le=20)):
     now = time.time()
     cache_key = f"{q}_{limit}"
-    
-    # 1. 檢查快取
     if cache_key in NEWS_CACHE:
         data, ts = NEWS_CACHE[cache_key]
-        if now - ts < NEWS_CACHE_TTL:
-            return data
-            
-    # 2. 快取失效，將 blocking IO 丟入 threadpool
+        if now - ts < NEWS_CACHE_TTL: return data
     data = await run_in_threadpool(_fetch_rss_sync, q, limit)
-    
-    # 3. 更新快取
-    if data:
-        NEWS_CACHE[cache_key] = (data, now)
-        
+    if data: NEWS_CACHE[cache_key] = (data, now)
     return data
 
 # ==========================
@@ -148,53 +134,51 @@ async def get_news(q: str = Query("全球市場 財經"), limit: int = Query(10,
 # ==========================
 def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ret"] = df["Close"].pct_change()
-
-    # 一、均線系統 
     df.ta.sma(length=20, append=True)
     df.ta.ema(length=20, append=True)
     df.ta.vwma(length=20, append=True)
-    
-    # 二、動能與趨勢類
     df.ta.macd(append=True)
     df.ta.adx(append=True)
     df.ta.rsi(length=14, append=True)
     df.ta.cci(length=20, append=True)
-    
-    # 三、波動率類
     df.ta.bbands(length=20, std=2, append=True)
-    
-    # 四、成交量類 
     df.ta.mfi(length=14, append=True) 
     df.ta.cmf(append=True) 
-    
-    # 計算日波動度
     df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
-    
     return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9"])
 
 # ==========================
-# 📡 抓取金融資料模組
+# 📡 抓取金融資料模組 (🚀 改用正規 FMP API)
 # ==========================
 async def fetch_price_history(symbol: str) -> pd.DataFrame:
     now = time.time()
     if symbol in PRICE_CACHE:
         df, ts = PRICE_CACHE[symbol]
-        if now - ts < PRICE_CACHE_TTL:
-            return df
+        if now - ts < PRICE_CACHE_TTL: return df
 
     def _download():
-        # 🚀 棄用 yf.download，改用 Ticker.history 避開 MultiIndex 欄位問題
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="2y", interval="1d")
+        # 呼叫 FMP 歷史股價 API (抓取過去 500 個交易日)
+        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=500&apikey={FMP_API_KEY}"
+        resp = requests.get(url)
+        if resp.status_code != 200: return pd.DataFrame()
         
-        if df is None or df.empty: 
-            return pd.DataFrame()
-            
-        # yfinance 的時間索引現在通常會帶有時區，這會讓 pandas-ta 後續計算出錯，我們先把它移除
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-            
+        data = resp.json()
+        if "historical" not in data: return pd.DataFrame()
+        
+        # 轉換成 pandas DataFrame
+        df = pd.DataFrame(data["historical"])
+        
+        # FMP 的資料是最新的在最前面，我們需要將它反轉 (舊 -> 新) 才能正確計算技術指標
+        df = df.iloc[::-1].reset_index(drop=True)
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+        
+        # 欄位首字母大寫，以符合 pandas-ta 的格式
+        df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
         df = df.dropna(subset=["Close", "Volume"])
+        
+        if len(df) < 30: return pd.DataFrame() # 資料太少無法算均線
+        
         return enrich_indicators(df)
 
     df = await run_in_threadpool(_download)
@@ -208,8 +192,14 @@ async def fetch_fundamental(symbol: str) -> Dict[str, float]:
         if now - ts < FUND_CACHE_TTL: return data
 
     def _fetch():
-        info = yf.Ticker(symbol).fast_info
-        return {"pe_ratio": getattr(info, "trailingPE", 15) or 15}
+        # 呼叫 FMP 即時報價 API 來取得 PE 本益比
+        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
+        resp = requests.get(url)
+        if resp.status_code == 200 and len(resp.json()) > 0:
+            info = resp.json()[0]
+            pe = info.get("pe")
+            return {"pe_ratio": pe if pe is not None else 15}
+        return {"pe_ratio": 15}
 
     try: data = await run_in_threadpool(_fetch)
     except Exception: data = {"pe_ratio": 15}
@@ -222,14 +212,11 @@ async def fetch_fundamental(symbol: str) -> Dict[str, float]:
 # ==========================
 def calculate_multi_factor_score(df: pd.DataFrame, fund_data: Dict[str, float]) -> Dict[str, Any]:
     latest = df.iloc[-1]
-    
-    # 1. 趨勢分數
     trend_score = 50
     if latest.get("Close") > latest.get("SMA_20", 0): trend_score += 15
     if latest.get("MACD_12_26_9", 0) > latest.get("MACDs_12_26_9", 0): trend_score += 15
     if latest.get("ADX_14", 0) > 25: trend_score += 10 
     
-    # 2. 動能分數
     mom_score = 50
     rsi = latest.get("RSI_14", 50)
     if 40 < rsi < 70: mom_score += 20
@@ -239,17 +226,13 @@ def calculate_multi_factor_score(df: pd.DataFrame, fund_data: Dict[str, float]) 
     if cci > 100: mom_score += 10
     elif cci < -100: mom_score -= 10
     
-    # 3. 量能分數 
     vol_score = 50
     if latest.get("MFI_14", 50) > 50: vol_score += 25
     if latest.get("CMF_20", 0) > 0: vol_score += 25
     
-    # 4. 基本面分數
     fund_score = max(0, min(100, 100 - (min(fund_data["pe_ratio"], 50) * 2)))
     
-    # --- 動態體制切換 (Regime Switching) ---
     is_high_vol = latest.get("volatility_20", 0) > 0.35
-    
     if is_high_vol:
         regime = "高波動防禦期"
         final_score = (trend_score * 0.1) + (mom_score * 0.1) + (vol_score * 0.4) + (fund_score * 0.4)
@@ -263,7 +246,7 @@ def calculate_multi_factor_score(df: pd.DataFrame, fund_data: Dict[str, float]) 
             "technical": int((trend_score + mom_score)/2),
             "fundamental": int(fund_score),
             "chip": int(vol_score),
-            "news": 65 # 結合前端顯示預設分數
+            "news": 65
         },
         "regime": regime
     }
@@ -277,19 +260,17 @@ async def analyze(request: AnalysisRequest):
     df = await fetch_price_history(symbol)
 
     if df.empty:
-        raise HTTPException(status_code=404, detail="找不到該股票資料")
+        raise HTTPException(status_code=404, detail="找不到該股票資料或 API 額度用盡")
 
     fund_data = await fetch_fundamental(symbol)
     scoring = calculate_multi_factor_score(df, fund_data)
     
-    # CVaR (預期落差) 計算
     recent_rets = df["ret"].tail(60).dropna()
     var_95 = recent_rets.quantile(0.05)
     cvar_95 = recent_rets[recent_rets <= var_95].mean() * 100 if not recent_rets.empty else -5
 
     last_price = float(df["Close"].iloc[-1])
     
-    # 隨機漫步模擬預測
     days = 14 if request.duration == "short" else 60 if request.duration == "mid" else 180
     drift = recent_rets.mean()
     vol = df["volatility_20"].iloc[-1] / np.sqrt(252)
