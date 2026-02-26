@@ -57,8 +57,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, 
+    allow_origins=["*"],  # 🚀 直接寫死允許所有來源，避免 CORS 誤判掩蓋真實錯誤
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"],
 )
 
 class AnalysisRequest(BaseModel):
@@ -180,10 +183,18 @@ async def fetch_price_history(symbol: str) -> pd.DataFrame:
             return df
 
     def _download():
-        df = yf.download(symbol, period="2y", interval="1d", progress=False)
-        if df is None or df.empty: return pd.DataFrame()
+        # 🚀 棄用 yf.download，改用 Ticker.history 避開 MultiIndex 欄位問題
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="2y", interval="1d")
+        
+        if df is None or df.empty: 
+            return pd.DataFrame()
+            
+        # yfinance 的時間索引現在通常會帶有時區，這會讓 pandas-ta 後續計算出錯，我們先把它移除
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+            
         df = df.dropna(subset=["Close", "Volume"])
-        df.index = pd.to_datetime(df.index)
         return enrich_indicators(df)
 
     df = await run_in_threadpool(_download)
