@@ -1,6 +1,5 @@
 import os
 import time
-import random
 import datetime
 import asyncio
 import urllib.parse
@@ -107,7 +106,8 @@ def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
     return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9", "EMA_60"])
 
-# ✅ 修正：配合前端需要的欄位 (tag, url, time, source, title)
+# ✅ 修復重點 1：改用 requests 加入 User-Agent，防止被 Yahoo 阻擋
+# ✅ 修復重點 2：把欄位名稱恢復成你原本的 title, link, published
 async def fetch_yahoo_news(symbol: str) -> List[Dict[str, Any]]:
     now = time.time()
     if symbol in NEWS_CACHE:
@@ -116,26 +116,35 @@ async def fetch_yahoo_news(symbol: str) -> List[Dict[str, Any]]:
             return data
 
     def _fetch():
-        # 如果是前端傳來的 "全球市場 財經"，用 SPY 當作替代搜尋以免報錯
-        query_symbol = "SPY" if "全球市場" in symbol else (symbol + ".TW" if is_taiwan_stock(symbol) else symbol)
+        query_symbol = symbol + ".TW" if is_taiwan_stock(symbol) else symbol
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={urllib.parse.quote(query_symbol)}&region=US&lang=en-US"
-        feed = feedparser.parse(url)
+        
+        # 加上偽裝瀏覽器的 Header，騙過 Yahoo
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        }
+        
+        try:
+            # 先用 requests 抓取，再交給 feedparser 解析
+            resp = requests.get(url, headers=headers, timeout=10)
+            feed = feedparser.parse(resp.content)
+        except Exception as e:
+            print(f"Fetch news error: {e}")
+            return []
+
         news_list = []
-        tags = ["財經", "風險", "評論", "快訊"]
-        for entry in feed.entries[:10]: # 抓取最新 10 則
+        for entry in feed.entries[:6]: 
             try:
                 dt = parsedate_to_datetime(entry.published)
                 pub_str = dt.strftime("%Y-%m-%d %H:%M")
             except:
                 pub_str = entry.get("published", "")
             
-            # 對齊 React 前端的資料結構
+            # 恢復你前端原本在吃的變數名稱
             news_list.append({
-                "tag": random.choice(tags),       # 隨機塞個標籤讓前端有顏色
                 "title": entry.get("title", ""),
-                "url": entry.get("link", ""),     # 前端用 n.url
-                "source": "Yahoo Finance",        # 前端用 n.source
-                "time": pub_str                   # 前端用 n.time
+                "link": entry.get("link", ""),
+                "published": pub_str
             })
         return news_list
 
@@ -222,7 +231,7 @@ def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
 # 🚀 API 路由區
 # ==========================
 
-# 1️⃣ 分析與大盤比較 API (✅ 補齊所有前端畫圖需要的資料)
+# 1️⃣ 分析與大盤比較 API 
 @app.post("/api/analyze")
 async def analyze(request: AnalysisRequest):
     symbol = request.symbol.strip().upper()
@@ -377,21 +386,11 @@ async def get_portfolio(username: str):
         "positions": positions
     }
 
-# 4️⃣ 新聞 API (✅ 修正：配合前端使用 Query 參數抓取，並直接回傳 Array)
-@app.get("/api/news")
-async def get_news(
-    q: str = Query("全球市場", description="搜尋關鍵字或股票代碼"), 
-    limit: int = Query(10, description="新聞數量")
-):
-    # 前端透過 /api/news?q=...&limit=10 呼叫
-    query_symbol = q.strip().upper()
-    news = await fetch_yahoo_news(query_symbol)
-    
-    if limit and len(news) > limit:
-        news = news[:limit]
-        
-    # 前端的 setNewsList(data) 預期收到一個 List，所以直接回傳 news 陣列
-    return news
+# 4️⃣ 新聞 API (✅ 修復重點 3：恢復回傳格式，符合前端原本的寫法)
+@app.get("/api/news/{symbol}")
+async def get_news(symbol: str):
+    news = await fetch_yahoo_news(symbol.upper())
+    return {"symbol": symbol.upper(), "news": news}
 
 
 if __name__ == "__main__":
