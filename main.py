@@ -27,8 +27,9 @@ PRICE_CACHE: Dict[str, Tuple[pd.DataFrame, float]] = {}
 FUND_CACHE: Dict[str, Tuple[Dict[str, Any], float]] = {}
 NEWS_CACHE: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
 
-PRICE_CACHE_TTL = 600      
+PRICE_CACHE_TTL = 600       
 FUND_CACHE_TTL = 86400     
+NEWS_CACHE_TTL = 3600 # ✅ 新增：新聞快取 1 小時
 
 # ==========================
 # ⚙️ FastAPI 初始化 & DB
@@ -106,43 +107,49 @@ def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
     return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9", "EMA_60"])
 
-# ✅ 修復重點 1：改用 requests 加入 User-Agent，防止被 Yahoo 阻擋
-# ✅ 修復重點 2：把欄位名稱恢復成你原本的 title, link, published
-async def fetch_yahoo_news(symbol: str) -> List[Dict[str, Any]]:
+# ✅ 替換為 Google News 抓取器，包含快取與強制財經關鍵字
+async def fetch_google_news(keyword: str, is_tw: bool = True) -> List[Dict[str, Any]]:
     now = time.time()
-    if symbol in NEWS_CACHE:
-        data, ts = NEWS_CACHE[symbol]
-        if now - ts < 3600:
+    cache_key = f"{keyword}_{is_tw}"
+    
+    if cache_key in NEWS_CACHE:
+        data, ts = NEWS_CACHE[cache_key]
+        if now - ts < NEWS_CACHE_TTL:
             return data
 
     def _fetch():
-        query_symbol = symbol + ".TW" if is_taiwan_stock(symbol) else symbol
-        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={urllib.parse.quote(query_symbol)}&region=US&lang=en-US"
+        if is_tw:
+            search_query = f'"{keyword}" AND (股票 OR 股市 OR 財報 OR 營收)'
+            url = f"https://news.google.com/rss/search?q={urllib.parse.quote(search_query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        else:
+            search_query = f'"{keyword}" AND (stock OR market OR earnings OR shares)'
+            url = f"https://news.google.com/rss/search?q={urllib.parse.quote(search_query)}&hl=en-US&gl=US&ceid=US:en"
         
-        # 加上偽裝瀏覽器的 Header，騙過 Yahoo
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
         }
         
         try:
-            # 先用 requests 抓取，再交給 feedparser 解析
             resp = requests.get(url, headers=headers, timeout=10)
             feed = feedparser.parse(resp.content)
         except Exception as e:
-            print(f"Fetch news error: {e}")
+            print(f"Google News Fetch error: {e}")
             return []
 
         news_list = []
-        for entry in feed.entries[:6]: 
+        for entry in feed.entries[:10]: # 提供 10 篇新聞
             try:
                 dt = parsedate_to_datetime(entry.published)
                 pub_str = dt.strftime("%Y-%m-%d %H:%M")
             except:
                 pub_str = entry.get("published", "")
             
-            # 恢復你前端原本在吃的變數名稱
+            clean_title = entry.get("title", "")
+            if " - " in clean_title:
+                clean_title = clean_title.rsplit(" - ", 1)[0]
+
             news_list.append({
-                "title": entry.get("title", ""),
+                "title": clean_title,
                 "link": entry.get("link", ""),
                 "published": pub_str
             })
@@ -150,7 +157,7 @@ async def fetch_yahoo_news(symbol: str) -> List[Dict[str, Any]]:
 
     data = await run_in_threadpool(_fetch)
     if data:
-        NEWS_CACHE[symbol] = (data, now)
+        NEWS_CACHE[cache_key] = (data, now)
     return data
 
 async def fetch_price_history(symbol: str) -> pd.DataFrame:
@@ -238,8 +245,11 @@ async def analyze(request: AnalysisRequest):
     df = await fetch_price_history(symbol)
     if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料")
 
-    news_data = await fetch_yahoo_news(symbol)
+    # ✅ 更新：改為使用 fetch_google_news
     is_tw = is_taiwan_stock(symbol)
+    clean_sym = clean_tw_symbol(symbol) if is_tw else symbol
+    news_data = await fetch_google_news(clean_sym, is_tw=is_tw)
+    
     bench_df = await fetch_benchmark(is_tw)
     
     beta = 1.0
@@ -386,11 +396,25 @@ async def get_portfolio(username: str):
         "positions": positions
     }
 
-# 4️⃣ 新聞 API (✅ 修復重點 3：恢復回傳格式，符合前端原本的寫法)
+# 4️⃣ 新聞 API (✅ 更新：改用 Google News 並清理股票代碼)
 @app.get("/api/news/{symbol}")
 async def get_news(symbol: str):
-    news = await fetch_yahoo_news(symbol.upper())
+    is_tw = is_taiwan_stock(symbol)
+    clean_sym = clean_tw_symbol(symbol) if is_tw else symbol.upper()
+    news = await fetch_google_news(clean_sym, is_tw=is_tw)
     return {"symbol": symbol.upper(), "news": news}
+
+# 5️⃣ 新增：讓使用者自訂關鍵字搜尋新聞 API
+@app.get("/api/news/search/")
+async def search_custom_news(
+    q: str = Query(..., description="使用者輸入的搜尋關鍵字"), 
+    is_tw: bool = Query(True, description="是否搜尋中文/台灣市場")
+):
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="關鍵字不能為空")
+        
+    news = await fetch_google_news(q.strip(), is_tw=is_tw)
+    return {"query": q, "news": news}
 
 
 if __name__ == "__main__":
