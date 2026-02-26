@@ -9,6 +9,7 @@ import pandas_ta as ta  # 🚀 最強大的技術指標庫
 import yfinance as yf
 import aiosqlite
 import feedparser       # 新聞 RSS 解析
+import requests         # 🚀 新增：用來建立偽裝 session 的套件
 
 from typing import Dict, Any, Tuple, List, Optional
 from email.utils import parsedate_to_datetime
@@ -183,8 +184,14 @@ async def fetch_price_history(symbol: str) -> pd.DataFrame:
             return df
 
     def _download():
-        # 🚀 棄用 yf.download，改用 Ticker.history 避開 MultiIndex 欄位問題
-        ticker = yf.Ticker(symbol)
+        # 🚀 建立自訂 Session，偽裝成正常的 Chrome 瀏覽器，減少被 Yahoo 阻擋的機率
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        
+        # 🚀 棄用 yf.download，改用 Ticker.history 避開 MultiIndex 欄位問題，並帶入 session
+        ticker = yf.Ticker(symbol, session=session)
         df = ticker.history(period="2y", interval="1d")
         
         if df is None or df.empty: 
