@@ -5,15 +5,15 @@ import asyncio
 import urllib.parse
 import numpy as np
 import pandas as pd
-import pandas_ta as ta  # 🚀 最強大的技術指標庫
+import pandas_ta as ta
 import aiosqlite
-import feedparser       # 新聞 RSS 解析
-import requests         # API 請求套件
+import feedparser
+import requests
 
 from typing import Dict, Any, Tuple, List, Optional
 from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
@@ -21,23 +21,17 @@ from pydantic import BaseModel
 APP_NAME = "stock-backend-quant-pro"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "stock_app.db")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-
-# 🚀 讀取你在 Render 設定的 FMP API Key
 FMP_API_KEY = os.getenv("FMP_API_KEY", "demo")
 
-# ==========================
-# 🗄️ 全域快取系統 (Cache)
-# ==========================
 PRICE_CACHE: Dict[str, Tuple[pd.DataFrame, float]] = {}
 FUND_CACHE: Dict[str, Tuple[Dict[str, Any], float]] = {}
 NEWS_CACHE: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
 
 PRICE_CACHE_TTL = 600      
 FUND_CACHE_TTL = 86400     
-NEWS_CACHE_TTL = 3600      
 
 # ==========================
-# ⚙️ FastAPI 初始化 & DB
+# ⚙️ FastAPI 初始化 & DB (✅ 新增投資組合資料表)
 # ==========================
 async def init_db():
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -48,6 +42,18 @@ async def init_db():
                 username TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                UNIQUE(username, symbol)
+            )
+        """)
+        # 🆕 投資組合資料表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS portfolios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                shares REAL NOT NULL,
+                avg_cost REAL NOT NULL,
+                updated_at TEXT NOT NULL,
                 UNIQUE(username, symbol)
             )
         """)
@@ -67,99 +73,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- 請求模型 ---
 class AnalysisRequest(BaseModel):
     symbol: str
-    principal: float
-    duration: str
+    principal: float = 100000
+    duration: str = "mid"
+
+class PortfolioItem(BaseModel):
+    username: str
+    symbol: str
+    shares: float
+    avg_cost: float
 
 # ==========================
-# 📰 外部新聞抓取模組
-# ==========================
-def parse_dt(entry: dict) -> Optional[datetime.datetime]:
-    if entry.get("published_parsed"):
-        try: return datetime.datetime(*entry["published_parsed"][:6])
-        except: pass
-    if entry.get("published"):
-        try: return parsedate_to_datetime(entry["published"])
-        except: return None
-    return None
-
-def _fetch_rss_sync(query: str, limit: int) -> List[Dict[str, Any]]:
-    safe_query = urllib.parse.quote(query.strip())
-    rss_url = f"https://news.google.com/rss/search?q={safe_query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-    try: feed = feedparser.parse(rss_url)
-    except Exception: return []
-
-    items = []
-    for e in feed.entries[:limit * 2]:
-        dt = parse_dt(e)
-        title = getattr(e, "title", "")
-        tag = "產業"
-        low_title = title.lower()
-        if any(k in low_title for k in ["風險", "戰", "通膨", "升息", "fed", "跌", "警告"]): tag = "風險"
-        if any(k in low_title for k in ["法說", "財報", "營收", "目標價", "漲", "創新高"]): tag = "評論"
-        
-        items.append({
-            "tag": tag,
-            "time": getattr(e, "published", "") or (dt.strftime("%Y-%m-%d %H:%M") if dt else ""),
-            "published_at": dt.isoformat() if dt else "",
-            "title": title,
-            "url": getattr(e, "link", ""),
-            "source": getattr(e, "source", {}).get("title", "Google News") if hasattr(e, "source") else "Google News"
-        })
-        
-    seen = set()
-    uniq = []
-    for it in items:
-        if it["url"] not in seen:
-            seen.add(it["url"])
-            uniq.append(it)
-            
-    uniq.sort(key=lambda x: x["published_at"], reverse=True)
-    return uniq[:limit]
-
-@app.get("/api/news")
-async def get_news(q: str = Query("全球市場 財經"), limit: int = Query(10, ge=1, le=20)):
-    now = time.time()
-    cache_key = f"{q}_{limit}"
-    if cache_key in NEWS_CACHE:
-        data, ts = NEWS_CACHE[cache_key]
-        if now - ts < NEWS_CACHE_TTL: return data
-    data = await run_in_threadpool(_fetch_rss_sync, q, limit)
-    if data: NEWS_CACHE[cache_key] = (data, now)
-    return data
-
-# ==========================
-# 📊 核心：海量指標計算引擎
-# ==========================
-def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df["ret"] = df["Close"].pct_change()
-    df.ta.sma(length=20, append=True)
-    df.ta.ema(length=20, append=True)
-    df.ta.vwma(length=20, append=True)
-    df.ta.macd(append=True)
-    df.ta.adx(append=True)
-    df.ta.rsi(length=14, append=True)
-    df.ta.cci(length=20, append=True)
-    df.ta.bbands(length=20, std=2, append=True)
-    df.ta.mfi(length=14, append=True) 
-    df.ta.cmf(append=True) 
-    df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
-    return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9"])
-
-# ==========================
-# 🔀 智慧路由：判斷台股或美股
+# 🔀 核心邏輯與抓取模組
 # ==========================
 def is_taiwan_stock(symbol: str) -> bool:
-    clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
-    return clean_symbol.isdigit()
+    return symbol.replace(".TW", "").replace(".TWO", "").isdigit()
 
 def clean_tw_symbol(symbol: str) -> str:
     return symbol.replace(".TW", "").replace(".TWO", "")
 
-# ==========================
-# 📡 抓取金融資料模組 (台美雙引擎)
-# ==========================
+def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df["ret"] = df["Close"].pct_change()
+    df.ta.sma(length=20, append=True)
+    df.ta.ema(length=60, append=True) # 用於回測
+    df.ta.vwma(length=20, append=True)
+    df.ta.macd(append=True)
+    df.ta.rsi(length=14, append=True)
+    df.ta.cci(length=20, append=True)
+    df.ta.mfi(length=14, append=True) 
+    df.ta.cmf(append=True) 
+    df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
+    return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9", "EMA_60"])
+
 async def fetch_price_history(symbol: str) -> pd.DataFrame:
     now = time.time()
     if symbol in PRICE_CACHE:
@@ -169,223 +116,183 @@ async def fetch_price_history(symbol: str) -> pd.DataFrame:
     def _download():
         if is_taiwan_stock(symbol):
             tw_id = clean_tw_symbol(symbol)
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=700)).strftime("%Y-%m-%d")
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=1000)).strftime("%Y-%m-%d")
             url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={tw_id}&start_date={start_date}"
             resp = requests.get(url)
             if resp.status_code != 200: return pd.DataFrame()
-            data = resp.json()
-            if "data" not in data or not data["data"]: return pd.DataFrame()
-            
-            df = pd.DataFrame(data["data"])
+            data = resp.json().get("data", [])
+            if not data: return pd.DataFrame()
+            df = pd.DataFrame(data)
             df.rename(columns={"open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"}, inplace=True)
             df["date"] = pd.to_datetime(df["date"])
             df.set_index("date", inplace=True)
-            
         else:
-            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=500&apikey={FMP_API_KEY}"
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=1000&apikey={FMP_API_KEY}"
             resp = requests.get(url)
             if resp.status_code != 200: return pd.DataFrame()
-            data = resp.json()
-            if "historical" not in data: return pd.DataFrame()
-            
-            df = pd.DataFrame(data["historical"])
-            df = df.iloc[::-1].reset_index(drop=True)
+            data = resp.json().get("historical", [])
+            if not data: return pd.DataFrame()
+            df = pd.DataFrame(data).iloc[::-1].reset_index(drop=True)
             df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
             df["date"] = pd.to_datetime(df["date"])
             df.set_index("date", inplace=True)
 
         df = df.dropna(subset=["Close", "Volume"])
-        if len(df) < 30: return pd.DataFrame()
+        if len(df) < 60: return pd.DataFrame()
         return enrich_indicators(df)
 
     df = await run_in_threadpool(_download)
     if not df.empty: PRICE_CACHE[symbol] = (df, now)
     return df
 
-async def fetch_fundamental(symbol: str) -> Dict[str, float]:
-    now = time.time()
-    if symbol in FUND_CACHE:
-        data, ts = FUND_CACHE[symbol]
-        if now - ts < FUND_CACHE_TTL: return data
-
-    def _fetch():
-        if is_taiwan_stock(symbol):
-            tw_id = clean_tw_symbol(symbol)
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-            url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPER&data_id={tw_id}&start_date={start_date}"
-            resp = requests.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "data" in data and len(data["data"]) > 0:
-                    return {"pe_ratio": data["data"][-1].get("PER", 15)}
-            return {"pe_ratio": 15}
-        else:
-            url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
-            resp = requests.get(url)
-            if resp.status_code == 200 and len(resp.json()) > 0:
-                pe = resp.json()[0].get("pe")
-                return {"pe_ratio": pe if pe is not None else 15}
-            return {"pe_ratio": 15}
-
-    try: data = await run_in_threadpool(_fetch)
-    except Exception: data = {"pe_ratio": 15}
-        
-    FUND_CACHE[symbol] = (data, now)
-    return data
+# ✅ 新增：抓取大盤基準 (Benchmark)
+async def fetch_benchmark(is_tw: bool) -> pd.DataFrame:
+    bench_symbol = "0050" if is_tw else "SPY"
+    return await fetch_price_history(bench_symbol)
 
 # ==========================
-# 🧠 AI 專業量化引擎 (動態 IC 權重 + 去共線性)
+# 📈 回測與績效計算引擎 (✅ 新增回測功能)
 # ==========================
-def calculate_multi_factor_score(df: pd.DataFrame, fund_data: Dict[str, float]) -> Dict[str, Any]:
-    # 保留最新的數值供最後評分使用
-    latest = df.iloc[-1].copy()
-    
-    # 1. 建立真實預測目標：未來 5 天的預期報酬 (Forward Return)
-    df["fwd_ret_5d"] = df["Close"].shift(-5) / df["Close"] - 1
-    
-    # 取最近 120 天作為 Walk-Forward 的訓練窗口 (需丟棄最後 5 天 NaN)
-    train_df = df.dropna(subset=["fwd_ret_5d", "MACD_12_26_9"]).tail(120).copy()
-    
-    if len(train_df) < 30: # 避免資料不足
-        return {"final_score": 50, "breakdown": {"technical": 50, "fundamental": 50, "chip": 50, "news": 50}, "regime": "資料不足"}
+def calculate_drawdown(returns: pd.Series) -> float:
+    cum_rets = (1 + returns).cumprod()
+    peak = cum_rets.cummax()
+    drawdown = (cum_rets - peak) / peak
+    return abs(drawdown.min()) * 100
 
-    # 2. 因子清單與分類 (轉化為可比較的數值)
-    train_df["trend_macd"] = train_df["MACD_12_26_9"] - train_df["MACDs_12_26_9"]
-    train_df["trend_sma"] = (train_df["Close"] - train_df["SMA_20"]) / train_df["SMA_20"]
-    train_df["mom_rsi"] = train_df["RSI_14"]
-    train_df["mom_cci"] = train_df["CCI_20_0.015"]
-    train_df["vol_mfi"] = train_df["MFI_14"]
-    train_df["vol_cmf"] = train_df["CMF_20"]
+def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
+    # 簡單量化策略：MACD 柱狀圖 > 0 且 價格 > 60日均線 時持有
+    df["signal"] = np.where((df["MACDh_12_26_9"] > 0) & (df["Close"] > df["EMA_60"]), 1, 0)
+    df["strategy_ret"] = df["signal"].shift(1) * df["ret"]
     
-    # 3. 計算 Information Coefficient (IC) - 使用 Pandas 內建 Spearman
-    ic_dict = {}
-    for factor in ["trend_macd", "trend_sma", "mom_rsi", "mom_cci", "vol_mfi", "vol_cmf"]:
-        ic = train_df[factor].corr(train_df["fwd_ret_5d"], method="spearman")
-        ic_dict[factor] = ic if pd.notna(ic) else 0
-
-    # 4. 因子去共線性 (選擇每組預測力最強的代表，拋棄高度相關的冗餘因子)
-    best_trend = "trend_macd" if abs(ic_dict["trend_macd"]) > abs(ic_dict["trend_sma"]) else "trend_sma"
-    best_mom = "mom_rsi" if abs(ic_dict["mom_rsi"]) > abs(ic_dict["mom_cci"]) else "mom_cci"
-    best_vol = "vol_mfi" if abs(ic_dict["vol_mfi"]) > abs(ic_dict["vol_cmf"]) else "vol_cmf"
-
-    # 5. 動態權重分配 (Dynamic Weighting based on IC)
-    total_ic = abs(ic_dict[best_trend]) + abs(ic_dict[best_mom]) + abs(ic_dict[best_vol])
-    if total_ic == 0: total_ic = 1 # 避免除以零
+    valid_rets = df["strategy_ret"].dropna()
+    cum_ret = (1 + valid_rets).cumprod().iloc[-1] - 1 if not valid_rets.empty else 0
+    bh_ret = (1 + df["ret"].dropna()).cumprod().iloc[-1] - 1 # Buy and Hold
     
-    w_trend = abs(ic_dict[best_trend]) / total_ic
-    w_mom = abs(ic_dict[best_mom]) / total_ic
-    w_vol = abs(ic_dict[best_vol]) / total_ic
-
-    # 6. 計算當前最新訊號的分數 (將因子標準化並乘上方向)
-    def get_signal_score(factor, current_val):
-        min_val, max_val = train_df[factor].min(), train_df[factor].max()
-        if max_val == min_val: return 50
-        score = (current_val - min_val) / (max_val - min_val) * 100
-        # 如果 IC 是負的，代表該因子是反向指標，自動倒轉分數
-        return score if ic_dict[factor] > 0 else 100 - score
-
-    curr_trend = (latest["MACD_12_26_9"] - latest["MACDs_12_26_9"]) if best_trend == "trend_macd" else (latest["Close"] - latest["SMA_20"]) / latest["SMA_20"]
-    curr_mom = latest["RSI_14"] if best_mom == "mom_rsi" else latest["CCI_20_0.015"]
-    curr_vol = latest["MFI_14"] if best_vol == "vol_mfi" else latest["CMF_20"]
-
-    trend_score = get_signal_score(best_trend, curr_trend)
-    mom_score = get_signal_score(best_mom, curr_mom)
-    vol_score = get_signal_score(best_vol, curr_vol)
+    mdd = calculate_drawdown(valid_rets)
+    sharpe = (valid_rets.mean() / valid_rets.std()) * np.sqrt(252) if valid_rets.std() > 0 else 0
     
-    # 基本面估值
-    fund_score = max(0, min(100, 100 - (min(fund_data["pe_ratio"], 50) * 2)))
-
-    # 7. 轉換為預測勝率 (Logistic 概念轉換)
-    raw_alpha = (trend_score * w_trend) + (mom_score * w_mom) + (vol_score * w_vol)
-    combined_score = (raw_alpha * 0.8) + (fund_score * 0.2)
-    
-    # 轉換為真實世界勝率 (40% ~ 70% 之間浮動)
-    win_rate = 40 + (combined_score / 100) * 30 
-    
-    ann_vol = latest.get("volatility_20", 0.2)
-    regime = "高波動洗盤期" if ann_vol > 0.35 else "穩健趨勢期"
+    win_days = len(valid_rets[valid_rets > 0])
+    total_trades = len(valid_rets[valid_rets != 0])
+    win_rate = (win_days / total_trades * 100) if total_trades > 0 else 0
 
     return {
-        "final_score": int(win_rate), 
-        "breakdown": {
-            "technical": int(trend_score),
-            "fundamental": int(fund_score),
-            "chip": int(vol_score),
-            "news": int(mom_score) # 借用 news 欄位放動能分數
-        },
-        "regime": f"{regime} | {best_trend.split('_')[1].upper()}驅動"
+        "cumulative_return_pct": round(cum_ret * 100, 2),
+        "buy_and_hold_return_pct": round(bh_ret * 100, 2),
+        "max_drawdown_pct": round(mdd, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "win_rate_pct": round(win_rate, 2)
     }
 
 # ==========================
-# 🚀 股票分析 API 路由 (厚尾分配 Monte Carlo)
+# 🚀 API 路由區
 # ==========================
+
+# 1️⃣ 分析與大盤比較 API
 @app.post("/api/analyze")
 async def analyze(request: AnalysisRequest):
     symbol = request.symbol.strip().upper()
     df = await fetch_price_history(symbol)
+    if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料")
 
-    if df.empty:
-        raise HTTPException(status_code=404, detail="找不到該股票資料或 API 額度用盡")
+    # ✅ 大盤比較 (Beta & Alpha 計算)
+    is_tw = is_taiwan_stock(symbol)
+    bench_df = await fetch_benchmark(is_tw)
+    
+    beta = 1.0
+    alpha = 0.0
+    if not bench_df.empty:
+        # 對齊日期計算共變異數
+        aligned = pd.concat([df["ret"], bench_df["ret"]], axis=1).dropna()
+        aligned.columns = ["stock", "bench"]
+        cov = aligned.cov().iloc[0, 1]
+        var = aligned["bench"].var()
+        if var > 0:
+            beta = cov / var
+            alpha = (aligned["stock"].mean() - beta * aligned["bench"].mean()) * 252 * 100
 
-    fund_data = await fetch_fundamental(symbol)
-    scoring = calculate_multi_factor_score(df, fund_data)
-    
-    # ==========================================
-    # 專業風險模型：GARCH 概念 + 厚尾 CVaR
-    # ==========================================
-    recent_rets = df["ret"].tail(120).dropna()
-    
-    # 使用 EWMA (指數加權移動平均) 近似 GARCH，捕捉近期波動群聚
-    ewma_vol = df["ret"].ewm(span=20).std().iloc[-1]
-    if pd.isna(ewma_vol): ewma_vol = recent_rets.std()
-    
-    # 真實世界 CVaR (計算 5% 尾部風險)
-    var_95 = recent_rets.quantile(0.05)
-    cvar_95 = recent_rets[recent_rets <= var_95].mean()
-    if pd.isna(cvar_95): cvar_95 = -0.05
-    
     last_price = float(df["Close"].iloc[-1])
-    days = 14 if request.duration == "short" else 60 if request.duration == "mid" else 180
+    recent_rets = df["ret"].tail(120).dropna()
+    cvar_95 = recent_rets[recent_rets <= recent_rets.quantile(0.05)].mean()
     
-    # 取得歷史 Drift，結合 AI 勝率進行 Alpha 調整
-    alpha_adjustment = (scoring["final_score"] - 50) / 1000 
-    drift = recent_rets.mean() + alpha_adjustment
-    
-    predictions = []
-    sim_p = last_price
-    
-    # Monte Carlo 升級：Student's t 分配 (自由度 df=4) 模擬 Fat Tail (厚尾現象)
-    df_t = 4 
-    scale_factor = np.sqrt((df_t - 2) / df_t) 
-    
-    for i in range(1, days + 1):
-        # 使用 numpy 原生的 standard_t 模擬極端黑天鵝
-        innovation = np.random.standard_t(df_t) * scale_factor
-        sim_p *= (1 + drift + ewma_vol * innovation)
-        predictions.append({
-            "date": (datetime.datetime.now() + datetime.timedelta(days=i)).strftime("%m-%d"),
-            "mid": round(sim_p, 2)
-        })
-
-    history_data = [
-        {"date": idx.strftime("%m-%d"), "price": round(float(row["Close"]), 2)}
-        for idx, row in df.tail(30).iterrows()
-    ]
-
     return {
         "symbol": symbol,
-        "ai_score": scoring["final_score"], # 現在輸出的是「勝率 %」
-        "ai_sentiment": scoring["regime"],
-        "score_breakdown": scoring["breakdown"],
-        "advice": {
-            "buy_price": round(last_price * 0.98, 2),
-            "take_profit": predictions[-1]["mid"],
-            "stop_loss": round(last_price * (1 + cvar_95), 2) # 真實 CVaR 停損
-        },
-        "chart_data": {
-            "history": history_data,
-            "prediction": predictions
+        "market_benchmark": "0050(台灣50)" if is_tw else "SPY(標普500)",
+        "quant_metrics": {
+            "beta": round(beta, 2),          # 衡量與大盤的連動性 (>1代表比大盤活潑)
+            "annual_alpha_pct": round(alpha, 2), # 衡量超越大盤的絕對報酬
+            "current_price": last_price,
+            "stop_loss_suggested": round(last_price * (1 + (cvar_95 if pd.notna(cvar_95) else -0.05)), 2)
         }
+    }
+
+# 2️⃣ 回測 API (✅ 新增)
+@app.get("/api/backtest/{symbol}")
+async def backtest_endpoint(symbol: str):
+    df = await fetch_price_history(symbol.upper())
+    if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料")
+    
+    bt_result = run_backtest(df)
+    return {"symbol": symbol.upper(), "backtest_3yr": bt_result}
+
+# 3️⃣ 投資組合管理 API (✅ 新增)
+@app.post("/api/portfolio")
+async def add_portfolio(item: PortfolioItem):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            INSERT INTO portfolios (username, symbol, shares, avg_cost, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(username, symbol) DO UPDATE SET
+            shares = excluded.shares, avg_cost = excluded.avg_cost, updated_at = excluded.updated_at
+        """, (item.username, item.symbol.upper(), item.shares, item.avg_cost, datetime.datetime.now().isoformat()))
+        await db.commit()
+    return {"message": "投資組合已更新"}
+
+@app.get("/api/portfolio/{username}")
+async def get_portfolio(username: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute("SELECT symbol, shares, avg_cost FROM portfolios WHERE username = ?", (username,)) as cursor:
+            rows = await cursor.fetchall()
+            
+    if not rows: return {"username": username, "total_value": 0, "positions": []}
+    
+    positions = []
+    total_value = 0
+    total_cost = 0
+    
+    for row in rows:
+        symbol, shares, avg_cost = row
+        df = await fetch_price_history(symbol)
+        current_price = float(df["Close"].iloc[-1]) if not df.empty else avg_cost
+        
+        market_value = current_price * shares
+        cost_value = avg_cost * shares
+        unrealized_pl = market_value - cost_value
+        unrealized_pl_pct = (unrealized_pl / cost_value * 100) if cost_value > 0 else 0
+        
+        total_value += market_value
+        total_cost += cost_value
+        
+        positions.append({
+            "symbol": symbol,
+            "shares": shares,
+            "avg_cost": avg_cost,
+            "current_price": current_price,
+            "market_value": round(market_value, 2),
+            "unrealized_pl": round(unrealized_pl, 2),
+            "unrealized_pl_pct": round(unrealized_pl_pct, 2)
+        })
+        
+    total_pl_pct = ((total_value - total_cost) / total_cost * 100) if total_cost > 0 else 0
+    
+    return {
+        "username": username,
+        "summary": {
+            "total_market_value": round(total_value, 2),
+            "total_cost": round(total_cost, 2),
+            "total_unrealized_pl": round(total_value - total_cost, 2),
+            "total_return_pct": round(total_pl_pct, 2)
+        },
+        "positions": positions
     }
 
 if __name__ == "__main__":
