@@ -107,6 +107,37 @@ def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
     return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9", "EMA_60"])
 
+# ✅ 加回：Yahoo 新聞抓取模組
+async def fetch_yahoo_news(symbol: str) -> List[Dict[str, Any]]:
+    now = time.time()
+    if symbol in NEWS_CACHE:
+        data, ts = NEWS_CACHE[symbol]
+        if now - ts < 3600:  # 快取 1 小時
+            return data
+
+    def _fetch():
+        query_symbol = symbol + ".TW" if is_taiwan_stock(symbol) else symbol
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={urllib.parse.quote(query_symbol)}&region=US&lang=en-US"
+        feed = feedparser.parse(url)
+        news_list = []
+        for entry in feed.entries[:5]: # 抓取最新 5 則
+            try:
+                dt = parsedate_to_datetime(entry.published)
+                pub_str = dt.strftime("%Y-%m-%d %H:%M")
+            except:
+                pub_str = entry.get("published", "")
+            news_list.append({
+                "title": entry.get("title", ""),
+                "link": entry.get("link", ""),
+                "published": pub_str
+            })
+        return news_list
+
+    data = await run_in_threadpool(_fetch)
+    if data:
+        NEWS_CACHE[symbol] = (data, now)
+    return data
+
 async def fetch_price_history(symbol: str) -> pd.DataFrame:
     now = time.time()
     if symbol in PRICE_CACHE:
@@ -145,13 +176,13 @@ async def fetch_price_history(symbol: str) -> pd.DataFrame:
     if not df.empty: PRICE_CACHE[symbol] = (df, now)
     return df
 
-# ✅ 新增：抓取大盤基準 (Benchmark)
+# ✅ 抓取大盤基準 (Benchmark)
 async def fetch_benchmark(is_tw: bool) -> pd.DataFrame:
     bench_symbol = "0050" if is_tw else "SPY"
     return await fetch_price_history(bench_symbol)
 
 # ==========================
-# 📈 回測與績效計算引擎 (✅ 新增回測功能)
+# 📈 回測與績效計算引擎
 # ==========================
 def calculate_drawdown(returns: pd.Series) -> float:
     cum_rets = (1 + returns).cumprod()
@@ -194,6 +225,9 @@ async def analyze(request: AnalysisRequest):
     df = await fetch_price_history(symbol)
     if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料")
 
+    # ✅ 把新聞一併抓回來
+    news_data = await fetch_yahoo_news(symbol)
+
     # ✅ 大盤比較 (Beta & Alpha 計算)
     is_tw = is_taiwan_stock(symbol)
     bench_df = await fetch_benchmark(is_tw)
@@ -222,10 +256,11 @@ async def analyze(request: AnalysisRequest):
             "annual_alpha_pct": round(alpha, 2), # 衡量超越大盤的絕對報酬
             "current_price": last_price,
             "stop_loss_suggested": round(last_price * (1 + (cvar_95 if pd.notna(cvar_95) else -0.05)), 2)
-        }
+        },
+        "news": news_data  # ✅ 加回原本回傳的資料中
     }
 
-# 2️⃣ 回測 API (✅ 新增)
+# 2️⃣ 回測 API
 @app.get("/api/backtest/{symbol}")
 async def backtest_endpoint(symbol: str):
     df = await fetch_price_history(symbol.upper())
@@ -234,7 +269,7 @@ async def backtest_endpoint(symbol: str):
     bt_result = run_backtest(df)
     return {"symbol": symbol.upper(), "backtest_3yr": bt_result}
 
-# 3️⃣ 投資組合管理 API (✅ 新增)
+# 3️⃣ 投資組合管理 API
 @app.post("/api/portfolio")
 async def add_portfolio(item: PortfolioItem):
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -294,6 +329,13 @@ async def get_portfolio(username: str):
         },
         "positions": positions
     }
+
+# 4️⃣ 新聞 API (✅ 補回獨立路由)
+@app.get("/api/news/{symbol}")
+async def get_news(symbol: str):
+    news = await fetch_yahoo_news(symbol.upper())
+    return {"symbol": symbol.upper(), "news": news}
+
 
 if __name__ == "__main__":
     import uvicorn
