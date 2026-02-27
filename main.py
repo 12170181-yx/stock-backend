@@ -78,6 +78,7 @@ class AnalysisRequest(BaseModel):
     symbol: str
     principal: float = 100000
     duration: str = "mid"
+    interval: str = "1d" # ✅ 新增：接收前端傳來的時間框架 (例如: 1d, 1wk, 1mo)
 
 class PortfolioItem(BaseModel):
     username: str
@@ -160,16 +161,18 @@ async def fetch_google_news(keyword: str, is_tw: bool = True) -> List[Dict[str, 
         NEWS_CACHE[cache_key] = (data, now)
     return data
 
-async def fetch_price_history(symbol: str) -> pd.DataFrame:
+# ✅ 修改：加入 interval 參數，並動態轉換 K 線週期
+async def fetch_price_history(symbol: str, interval: str = "1d") -> pd.DataFrame:
     now = time.time()
-    if symbol in PRICE_CACHE:
-        df, ts = PRICE_CACHE[symbol]
+    cache_key = f"{symbol}_{interval}" # ✅ 更新：快取 key 加入時間框架
+    if cache_key in PRICE_CACHE:
+        df, ts = PRICE_CACHE[cache_key]
         if now - ts < PRICE_CACHE_TTL: return df
 
     def _download():
         if is_taiwan_stock(symbol):
             tw_id = clean_tw_symbol(symbol)
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=1000)).strftime("%Y-%m-%d")
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=1500)).strftime("%Y-%m-%d") # 抓長一點確保週月線足夠
             url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={tw_id}&start_date={start_date}"
             resp = requests.get(url)
             if resp.status_code != 200: return pd.DataFrame()
@@ -180,7 +183,7 @@ async def fetch_price_history(symbol: str) -> pd.DataFrame:
             df["date"] = pd.to_datetime(df["date"])
             df.set_index("date", inplace=True)
         else:
-            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=1000&apikey={FMP_API_KEY}"
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=1500&apikey={FMP_API_KEY}"
             resp = requests.get(url)
             if resp.status_code != 200: return pd.DataFrame()
             data = resp.json().get("historical", [])
@@ -190,12 +193,18 @@ async def fetch_price_history(symbol: str) -> pd.DataFrame:
             df["date"] = pd.to_datetime(df["date"])
             df.set_index("date", inplace=True)
 
+        # ✅ 新增：利用 Pandas 重新採樣 (Resample) 切換時間框架
+        if interval == "1wk":
+            df = df.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'})
+        elif interval == "1mo":
+            df = df.resample('M').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'})
+
         df = df.dropna(subset=["Close", "Volume"])
         if len(df) < 60: return pd.DataFrame()
         return enrich_indicators(df)
 
     df = await run_in_threadpool(_download)
-    if not df.empty: PRICE_CACHE[symbol] = (df, now)
+    if not df.empty: PRICE_CACHE[cache_key] = (df, now)
     return df
 
 async def fetch_benchmark(is_tw: bool) -> pd.DataFrame:
@@ -242,8 +251,9 @@ def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
 @app.post("/api/analyze")
 async def analyze(request: AnalysisRequest):
     symbol = request.symbol.strip().upper()
-    df = await fetch_price_history(symbol)
-    if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料")
+    interval = request.interval # ✅ 新增：取得要求的時間框架
+    df = await fetch_price_history(symbol, interval)
+    if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料或資料不足")
 
     # ✅ 更新：改為使用 fetch_google_news
     is_tw = is_taiwan_stock(symbol)
@@ -269,28 +279,41 @@ async def analyze(request: AnalysisRequest):
     cvar_95 = recent_rets[recent_rets <= recent_rets.quantile(0.05)].mean()
     
     # --- 準備圖表資料 ---
-    hist_df = df.tail(60).reset_index() 
-    history_data = [
-        {"date": row["date"].strftime("%Y-%m-%d"), "price": round(row["Close"], 2)}
-        for _, row in hist_df.iterrows()
-    ]
+    # ✅ 修改：把資料抓長一點(120筆)，並塞入完整的 OHLC 及技術指標
+    hist_df = df.tail(120).reset_index() 
+    history_data = []
+    for _, row in hist_df.iterrows():
+        history_data.append({
+            "date": row["date"].strftime("%Y-%m-%d"),
+            "price": round(row["Close"], 2), # 保留舊版相容性
+            "open": round(row["Open"], 2),
+            "high": round(row["High"], 2),
+            "low": round(row["Low"], 2),
+            "close": round(row["Close"], 2),
+            "sma20": round(row.get("SMA_20", 0), 2) if pd.notna(row.get("SMA_20")) else None,
+            "ema60": round(row.get("EMA_60", 0), 2) if pd.notna(row.get("EMA_60")) else None,
+            "rsi14": round(row.get("RSI_14", 0), 2) if pd.notna(row.get("RSI_14")) else None,
+            "macd": round(row.get("MACD_12_26_9", 0), 2) if pd.notna(row.get("MACD_12_26_9")) else None,
+        })
 
     last_date = hist_df["date"].iloc[-1]
     volatility = df["ret"].std()
     prediction_data = []
     current_sim_price = last_price
     
-    # 產生 15 天的預測漫步
+    # 產生 15 期的預測漫步
     for i in range(1, 16):
-        sim_date = last_date + datetime.timedelta(days=i)
-        if sim_date.weekday() < 5: 
-            drift = recent_rets.mean() if not pd.isna(recent_rets.mean()) else 0
-            shock = np.random.normal(drift, volatility)
-            current_sim_price = current_sim_price * (1 + shock)
-            prediction_data.append({
-                "date": sim_date.strftime("%Y-%m-%d"),
-                "mid": round(current_sim_price, 2)
-            })
+        sim_date = last_date + datetime.timedelta(days=i * (7 if interval == '1wk' else (30 if interval == '1mo' else 1)))
+        if interval == '1d' and sim_date.weekday() >= 5: # 如果是日線跳過六日
+            continue
+            
+        drift = recent_rets.mean() if not pd.isna(recent_rets.mean()) else 0
+        shock = np.random.normal(drift, volatility)
+        current_sim_price = current_sim_price * (1 + shock)
+        prediction_data.append({
+            "date": sim_date.strftime("%Y-%m-%d"),
+            "mid": round(current_sim_price, 2)
+        })
 
     # --- 準備評分資料 ---
     current_rsi = float(df["RSI_14"].iloc[-1]) if "RSI_14" in df.columns else 50
@@ -415,7 +438,6 @@ async def search_custom_news(
         
     news = await fetch_google_news(q.strip(), is_tw=is_tw)
     return {"query": q, "news": news}
-
 
 if __name__ == "__main__":
     import uvicorn
