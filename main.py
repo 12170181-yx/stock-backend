@@ -223,6 +223,7 @@ def calculate_drawdown(returns: pd.Series) -> float:
     return abs(drawdown.min()) * 100
 
 def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
+    # 策略核心：MACD 柱狀圖大於 0 且 收盤價站在 60 日均線之上
     df["signal"] = np.where((df["MACDh_12_26_9"] > 0) & (df["Close"] > df["EMA_60"]), 1, 0)
     df["strategy_ret"] = df["signal"].shift(1) * df["ret"]
     
@@ -233,6 +234,34 @@ def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
     mdd = calculate_drawdown(valid_rets)
     sharpe = (valid_rets.mean() / valid_rets.std()) * np.sqrt(252) if valid_rets.std() > 0 else 0
     
+    # ==========================================
+    # 🚀 新增：進階量化指標 (Quant Metrics)
+    # ==========================================
+    
+    # 1. CAGR / 年化報酬率 (假設一年 252 個交易日)
+    trading_days = len(valid_rets)
+    years = trading_days / 252
+    cagr = ((1 + cum_ret) ** (1 / years) - 1) if years > 0 else 0
+    
+    # 2. Sortino Ratio (索提諾比率：只懲罰下行風險)
+    downside_rets = valid_rets[valid_rets < 0]
+    downside_std = downside_rets.std() * np.sqrt(252)
+    annualized_ret = valid_rets.mean() * 252
+    sortino = (annualized_ret / downside_std) if downside_std > 0 else 0
+    
+    # 3. Calmar Ratio (卡瑪比率：年化報酬 / 最大回撤)
+    mdd_decimal = mdd / 100 # 將前面算出的 % 換算回小數
+    calmar = (cagr / mdd_decimal) if mdd_decimal > 0 else 0
+    
+    # 4. Walk-forward test (簡易步進測試：計算每年的獨立績效)
+    df["year"] = df.index.year
+    yearly_rets = df.groupby("year")["strategy_ret"].apply(
+        lambda x: (1 + x).cumprod().iloc[-1] - 1 if len(x) > 0 else 0
+    )
+    walk_forward_metrics = {str(int(year)): round(ret * 100, 2) for year, ret in yearly_rets.items()}
+    
+    # ==========================================
+    
     win_days = len(valid_rets[valid_rets > 0])
     total_trades = len(valid_rets[valid_rets != 0])
     win_rate = (win_days / total_trades * 100) if total_trades > 0 else 0
@@ -240,9 +269,13 @@ def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
     return {
         "cumulative_return_pct": round(cum_ret * 100, 2),
         "buy_and_hold_return_pct": round(bh_ret * 100, 2),
+        "cagr_pct": round(cagr * 100, 2),            # ✅ 新增：年化報酬
         "max_drawdown_pct": round(mdd, 2),
         "sharpe_ratio": round(sharpe, 2),
-        "win_rate_pct": round(win_rate, 2)
+        "sortino_ratio": round(sortino, 2),          # ✅ 新增：索提諾比率
+        "calmar_ratio": round(calmar, 2),            # ✅ 新增：卡瑪比率
+        "win_rate_pct": round(win_rate, 2),
+        "walk_forward_yearly_pct": walk_forward_metrics # ✅ 新增：步進測試(逐年績效)
     }
 
 # ==========================
