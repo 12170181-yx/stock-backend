@@ -9,6 +9,10 @@ numpy
 yfinance
 pandas-ta    # 🚀 新增：最強大的技術指標計算引擎
 
+# --- 機器學習與進階風險模型 (機構級核心) ---
+scikit-learn # 🚀 新增：機器學習套件 (用於 RandomForest 因子貢獻度計算)
+scipy        # 🚀 新增：高階科學運算套件 (用於風險模型底層依賴)
+
 # --- 資料庫 ---
 aiosqlite    # 🚀 新增：非同步 SQLite，解決高併發鎖死問題
 
