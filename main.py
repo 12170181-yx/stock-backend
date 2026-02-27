@@ -106,7 +106,8 @@ def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.mfi(length=14, append=True) 
     df.ta.cmf(append=True) 
     df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
-    return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9", "EMA_60"])
+    # 🚨 修正 1：移除了 EMA_60，確保月線資料過少時不會被丟棄
+    return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9"])
 
 # ✅ 替換為 Google News 抓取器，包含快取與強制財經關鍵字
 async def fetch_google_news(keyword: str, is_tw: bool = True) -> List[Dict[str, Any]]:
@@ -200,7 +201,8 @@ async def fetch_price_history(symbol: str, interval: str = "1d") -> pd.DataFrame
             df = df.resample('M').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'})
 
         df = df.dropna(subset=["Close", "Volume"])
-        if len(df) < 60: return pd.DataFrame()
+        # 🚨 修正 2：將最低 K 棒數量從 60 降至 20
+        if len(df) < 20: return pd.DataFrame()
         return enrich_indicators(df)
 
     df = await run_in_threadpool(_download)
@@ -279,8 +281,8 @@ async def analyze(request: AnalysisRequest):
     cvar_95 = recent_rets[recent_rets <= recent_rets.quantile(0.05)].mean()
     
     # --- 準備圖表資料 ---
-    # ✅ 修改：把資料抓長一點(120筆)，並塞入完整的 OHLC 及技術指標
-    hist_df = df.tail(120).reset_index() 
+    # 🚨 修正 3：將回傳給前端的資料增加到 300 筆，讓 K 線圖不再空蕩蕩
+    hist_df = df.tail(300).reset_index() 
     history_data = []
     for _, row in hist_df.iterrows():
         history_data.append({
