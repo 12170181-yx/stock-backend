@@ -309,6 +309,33 @@ def calculate_robustness(df: pd.DataFrame) -> dict:
         bull_win_rate, bull_cagr = calc_regime_metrics(df[df['Regime'] == 'Bull'])
         bear_win_rate, bear_cagr = calc_regime_metrics(df[df['Regime'] == 'Bear'])
 
+        # ----------------------------------------------------
+        # 🚀 新增：計算樣本外報酬、過擬合風險、體制抗性評分
+        # ----------------------------------------------------
+        valid_rets = df["strategy_ret"].dropna()
+        
+        # A. 樣本外測試 (Out of Sample) - 取最近 60 個交易日 (約一季)
+        if len(valid_rets) > 60:
+            oos_rets = valid_rets.tail(60)
+            is_rets = valid_rets.iloc[:-60]
+            oos_return_pct = round(((1 + oos_rets).cumprod().iloc[-1] - 1) * 100, 2)
+            is_return_pct = ((1 + is_rets).cumprod().iloc[-1] - 1) * 100
+        else:
+            oos_return_pct = 0.0
+            is_return_pct = 0.0
+
+        # B. 過擬合風險 (Overfit Risk) - 比較樣本內與樣本外表現
+        if oos_return_pct < 0 and is_return_pct > 0:
+            overfit_risk = "高" # 訓練期賺錢，但最新一季賠錢
+        elif oos_return_pct >= 0 and oos_return_pct < (is_return_pct / max(1, (len(valid_rets)/60))):
+            overfit_risk = "中" # 賺比較少，稍微衰退
+        else:
+            overfit_risk = "低" # 樣本外表現依然強勁
+
+        # C. 體制抗性評分 (Resilience Score 0-100) - 熊市勝率越高，抗性越強
+        # 假設熊市勝率達到 50% 就算滿分 100
+        resilience_score = min(100, max(0, int((bear_win_rate / 50) * 100))) if pd.notna(bear_win_rate) else 50
+
         # 2. 滾動窗口測試 (Rolling Window) - 按「季」計算勝率
         df_temp = df.copy()
         df_temp['Quarter'] = df_temp.index.to_period('Q').astype(str)
@@ -329,7 +356,11 @@ def calculate_robustness(df: pd.DataFrame) -> dict:
             "bull_cagr": bull_cagr,
             "bear_win_rate": bear_win_rate,
             "bear_cagr": bear_cagr,
-            "rolling_data": rolling_data
+            "rolling_data": rolling_data,
+            # 👇 更新回傳值
+            "out_of_sample_return_pct": oos_return_pct,
+            "overfit_risk": overfit_risk,
+            "regime_resilience_score": resilience_score
         }
     except Exception as e:
         print(f"Robustness Error: {e}")
