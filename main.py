@@ -217,18 +217,18 @@ async def fetch_benchmark(is_tw: bool) -> pd.DataFrame:
     return await fetch_price_history(bench_symbol)
 
 # ==========================
-# 🧠 機器學習因子透明化引擎 (🚀 本次核心新增)
+# 🧠 機器學習因子透明化引擎 (🚀 真實數據驅動版)
 # ==========================
-def calculate_ml_factor_contributions(df: pd.DataFrame) -> dict:
+def calculate_ml_factor_contributions(df: pd.DataFrame) -> Optional[dict]:
     try:
         # 1. 萃取已計算的技術指標作為特徵 (Features)
         features = ["SMA_20", "MACD_12_26_9", "RSI_14", "volatility_20"]
         # 確保 DataFrame 中有這些欄位
         valid_features = [f for f in features if f in df.columns]
         
-        # 若資料不足以訓練，回傳預設值
+        # 若資料不足以訓練，直接回傳 None (業界做法：拒絕給出預設假資料)
         if len(valid_features) < 3 or len(df) < 50:
-            return _fallback_contributions()
+            return None
 
         ml_df = df.copy()
         
@@ -237,7 +237,7 @@ def calculate_ml_factor_contributions(df: pd.DataFrame) -> dict:
         ml_df = ml_df.dropna(subset=valid_features + ["target"])
 
         if len(ml_df) < 30:
-            return _fallback_contributions()
+            return None
 
         X = ml_df[valid_features]
         y = ml_df["target"]
@@ -266,29 +266,17 @@ def calculate_ml_factor_contributions(df: pd.DataFrame) -> dict:
         return {
             "upward_probability_pct": round(prob_up * 100, 1),
             "factor_importance": {
-                "趨勢動能 (Trend)": round((trend_weight / total_weight) * 100),
-                "超買超賣 (Momentum)": round((momentum_weight / total_weight) * 100),
-                "波動風險 (Volatility)": round((volatility_weight / total_weight) * 100)
+                "trend": round((trend_weight / total_weight), 4),
+                "momentum": round((momentum_weight / total_weight), 4),
+                "volatility": round((volatility_weight / total_weight), 4)
             }
         }
     except Exception as e:
         print(f"ML Factor Error: {e}")
-        return _fallback_contributions()
-
-def _fallback_contributions() -> dict:
-    # 發生資料不足或極端情況時的安全防護網
-    return {
-        "upward_probability_pct": 52.5,
-        "factor_importance": {
-            "趨勢動能 (Trend)": 40,
-            "超買超賣 (Momentum)": 35,
-            "波動風險 (Volatility)": 25
-        }
-    }
-
+        return None
 
 # ==========================================
-# 🛡️ 策略穩健性測試 (Robustness) - 🚀 本次新增
+# 🛡️ 策略穩健性測試 (Robustness)
 # ==========================================
 def calculate_robustness(df: pd.DataFrame) -> dict:
     try:
@@ -511,18 +499,23 @@ async def analyze(request: AnalysisRequest):
     # 🚀 這裡呼叫我們剛寫好的隨機森林模型
     ml_analysis = calculate_ml_factor_contributions(df)
     
-    # 將 ML 的上漲機率當作動態的 AI 總分
-    ai_total_score = int(ml_analysis["upward_probability_pct"])
+    # 如果有真實的 ML 預測數據，用它當作總分；如果沒有，就用 RSI 基礎分數代替
+    if ml_analysis:
+        ai_total_score = int(ml_analysis["upward_probability_pct"])
+        ml_prediction_data = {
+            "upward_probability_pct": ml_analysis["upward_probability_pct"],
+            "factors": ml_analysis["factor_importance"]
+        }
+    else:
+        ai_total_score = tech_score
+        ml_prediction_data = None
     
     return {
         "symbol": symbol,
         "market_benchmark": "0050(台灣50)" if is_tw else "SPY(標普500)",
         "ai_score": ai_total_score,
         "ai_sentiment": "偏多震盪" if ai_total_score > 50 else "弱勢整理",
-        "ml_prediction": { # 🚀 新增：這裡就是給前端畫圓餅圖或長條圖的因子貢獻度！
-            "upward_probability_pct": ml_analysis["upward_probability_pct"],
-            "factors": ml_analysis["factor_importance"]
-        },
+        "ml_prediction": ml_prediction_data,  # 👈 這裡如果是 None，前端就會自動隱藏面板
         "quant_metrics": {
             "beta": round(beta, 2),          
             "annual_alpha_pct": round(alpha, 2), 
