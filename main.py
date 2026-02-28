@@ -286,6 +286,56 @@ def _fallback_contributions() -> dict:
         }
     }
 
+
+# ==========================================
+# 🛡️ 策略穩健性測試 (Robustness) - 🚀 本次新增
+# ==========================================
+def calculate_robustness(df: pd.DataFrame) -> dict:
+    try:
+        if "strategy_ret" not in df.columns:
+            return {}
+        
+        # 1. 市場體制測試 (Market Regime) - 用 SMA200 切分牛熊
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        df['Regime'] = np.where(df['Close'] > df['SMA_200'], 'Bull', 'Bear')
+        
+        def calc_regime_metrics(sub_df):
+            if sub_df.empty: return 0.0, 0.0
+            win_rate = (sub_df['strategy_ret'] > 0).mean() * 100
+            cagr = (sub_df['strategy_ret'].mean() * 252) * 100
+            return (round(win_rate, 1) if pd.notna(win_rate) else 0.0, 
+                    round(cagr, 1) if pd.notna(cagr) else 0.0)
+
+        bull_win_rate, bull_cagr = calc_regime_metrics(df[df['Regime'] == 'Bull'])
+        bear_win_rate, bear_cagr = calc_regime_metrics(df[df['Regime'] == 'Bear'])
+
+        # 2. 滾動窗口測試 (Rolling Window) - 按「季」計算勝率
+        df_temp = df.copy()
+        df_temp['Quarter'] = df_temp.index.to_period('Q').astype(str)
+        df_temp['Quarter_Str'] = df_temp['Quarter'].apply(lambda x: f"{x[2:4]}Q{x[-1]}")
+        
+        rolling_data = []
+        for q, group in df_temp.groupby('Quarter_Str'):
+            q_win_rate = (group['strategy_ret'] > 0).mean() * 100
+            rolling_data.append({
+                "period": q,
+                "winRate": round(q_win_rate, 1) if pd.notna(q_win_rate) else 0
+            })
+        
+        rolling_data = rolling_data[-12:] # 取最近 12 季
+
+        return {
+            "bull_win_rate": bull_win_rate,
+            "bull_cagr": bull_cagr,
+            "bear_win_rate": bear_win_rate,
+            "bear_cagr": bear_cagr,
+            "rolling_data": rolling_data
+        }
+    except Exception as e:
+        print(f"Robustness Error: {e}")
+        return {}
+
+
 # ==========================
 # 📈 回測與績效計算引擎
 # ==========================
@@ -473,7 +523,15 @@ async def backtest_endpoint(symbol: str):
     if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料")
     
     bt_result = run_backtest(df)
-    return {"symbol": symbol.upper(), "backtest_3yr": bt_result}
+    
+    # 🚀 新增：計算穩健性，並將結果回傳！
+    robustness_result = calculate_robustness(df)
+    
+    return {
+        "symbol": symbol.upper(), 
+        "backtest_3yr": bt_result,
+        "robustness": robustness_result # ✅ 新增：放入 robustness 提供前端讀取
+    }
 
 # 3️⃣ 投資組合管理 API
 @app.post("/api/portfolio")
