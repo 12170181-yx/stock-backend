@@ -10,7 +10,7 @@ import aiosqlite
 import feedparser
 import requests
 
-# 🚀 新增：引入機器學習套件 (用於計算因子貢獻度)
+# 🚀 引入機器學習套件 (用於計算因子貢獻度)
 from sklearn.ensemble import RandomForestClassifier
 
 from typing import Dict, Any, Tuple, List, Optional
@@ -30,9 +30,9 @@ PRICE_CACHE: Dict[str, Tuple[pd.DataFrame, float]] = {}
 FUND_CACHE: Dict[str, Tuple[Dict[str, Any], float]] = {}
 NEWS_CACHE: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
 
-PRICE_CACHE_TTL = 600       
-FUND_CACHE_TTL = 86400     
-NEWS_CACHE_TTL = 3600 # ✅ 新增：新聞快取 1 小時
+PRICE_CACHE_TTL = 600        
+FUND_CACHE_TTL = 86400      
+NEWS_CACHE_TTL = 3600 
 
 # ==========================
 # ⚙️ FastAPI 初始化 & DB
@@ -81,7 +81,7 @@ class AnalysisRequest(BaseModel):
     symbol: str
     principal: float = 100000
     duration: str = "mid"
-    interval: str = "1d" # ✅ 新增：接收前端傳來的時間框架 (例如: 1d, 1wk, 1mo)
+    interval: str = "1d" 
 
 class PortfolioItem(BaseModel):
     username: str
@@ -100,8 +100,9 @@ def clean_tw_symbol(symbol: str) -> str:
 
 def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ret"] = df["Close"].pct_change()
+    # 計算各項技術指標
     df.ta.sma(length=20, append=True)
-    df.ta.ema(length=60, append=True) 
+    df.ta.ema(length=60, append=True)  # ✅ 務必保留，回測需要用到
     df.ta.vwma(length=20, append=True)
     df.ta.macd(append=True)
     df.ta.rsi(length=14, append=True)
@@ -109,10 +110,12 @@ def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.mfi(length=14, append=True) 
     df.ta.cmf(append=True) 
     df["volatility_20"] = df["ret"].rolling(20).std() * np.sqrt(252)
-    # 🚨 修正 1：移除了 EMA_60，確保月線資料過少時不會被丟棄
-    return df.dropna(subset=["SMA_20", "volatility_20", "MACD_12_26_9"])
+    
+    # ✅ 修正：確保回測與分析所需的欄位都存在才 Drop
+    required_cols = ["SMA_20", "EMA_60", "volatility_20", "MACDh_12_26_9", "RSI_14"]
+    valid_cols = [c for c in required_cols if c in df.columns]
+    return df.dropna(subset=valid_cols)
 
-# ✅ 替換為 Google News 抓取器，包含快取與強制財經關鍵字
 async def fetch_google_news(keyword: str, is_tw: bool = True) -> List[Dict[str, Any]]:
     now = time.time()
     cache_key = f"{keyword}_{is_tw}"
@@ -142,7 +145,7 @@ async def fetch_google_news(keyword: str, is_tw: bool = True) -> List[Dict[str, 
             return []
 
         news_list = []
-        for entry in feed.entries[:10]: # 提供 10 篇新聞
+        for entry in feed.entries[:10]:
             try:
                 dt = parsedate_to_datetime(entry.published)
                 pub_str = dt.strftime("%Y-%m-%d %H:%M")
@@ -165,10 +168,9 @@ async def fetch_google_news(keyword: str, is_tw: bool = True) -> List[Dict[str, 
         NEWS_CACHE[cache_key] = (data, now)
     return data
 
-# ✅ 修改：加入 interval 參數，並動態轉換 K 線週期
 async def fetch_price_history(symbol: str, interval: str = "1d") -> pd.DataFrame:
     now = time.time()
-    cache_key = f"{symbol}_{interval}" # ✅ 更新：快取 key 加入時間框架
+    cache_key = f"{symbol}_{interval}"
     if cache_key in PRICE_CACHE:
         df, ts = PRICE_CACHE[cache_key]
         if now - ts < PRICE_CACHE_TTL: return df
@@ -176,7 +178,7 @@ async def fetch_price_history(symbol: str, interval: str = "1d") -> pd.DataFrame
     def _download():
         if is_taiwan_stock(symbol):
             tw_id = clean_tw_symbol(symbol)
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=1500)).strftime("%Y-%m-%d") # 抓長一點確保週月線足夠
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=1500)).strftime("%Y-%m-%d")
             url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={tw_id}&start_date={start_date}"
             resp = requests.get(url)
             if resp.status_code != 200: return pd.DataFrame()
@@ -197,14 +199,12 @@ async def fetch_price_history(symbol: str, interval: str = "1d") -> pd.DataFrame
             df["date"] = pd.to_datetime(df["date"])
             df.set_index("date", inplace=True)
 
-        # ✅ 新增：利用 Pandas 重新採樣 (Resample) 切換時間框架
         if interval == "1wk":
             df = df.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'})
         elif interval == "1mo":
             df = df.resample('M').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'})
 
         df = df.dropna(subset=["Close", "Volume"])
-        # 🚨 修正 2：將最低 K 棒數量從 60 降至 20
         if len(df) < 20: return pd.DataFrame()
         return enrich_indicators(df)
 
@@ -217,22 +217,17 @@ async def fetch_benchmark(is_tw: bool) -> pd.DataFrame:
     return await fetch_price_history(bench_symbol)
 
 # ==========================
-# 🧠 機器學習因子透明化引擎 (🚀 真實數據驅動版)
+# 🧠 機器學習因子透明化引擎
 # ==========================
 def calculate_ml_factor_contributions(df: pd.DataFrame) -> Optional[dict]:
     try:
-        # 1. 萃取已計算的技術指標作為特徵 (Features)
         features = ["SMA_20", "MACD_12_26_9", "RSI_14", "volatility_20"]
-        # 確保 DataFrame 中有這些欄位
         valid_features = [f for f in features if f in df.columns]
         
-        # 若資料不足以訓練，直接回傳 None (業界做法：拒絕給出預設假資料)
         if len(valid_features) < 3 or len(df) < 50:
             return None
 
         ml_df = df.copy()
-        
-        # 2. 定義目標變數 (Target)：明天收盤價是否大於今天收盤價 (1=漲, 0=跌)
         ml_df["target"] = (ml_df["Close"].shift(-1) > ml_df["Close"]).astype(int)
         ml_df = ml_df.dropna(subset=valid_features + ["target"])
 
@@ -242,24 +237,19 @@ def calculate_ml_factor_contributions(df: pd.DataFrame) -> Optional[dict]:
         X = ml_df[valid_features]
         y = ml_df["target"]
 
-        # 3. 訓練隨機森林模型 (輕量級，確保 API 1秒內回應)
         rf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
         rf.fit(X, y)
 
-        # 4. 預測「今日」的上漲機率
         latest_X = df[valid_features].iloc[-1:].fillna(method='ffill').fillna(0)
         prob_up = rf.predict_proba(latest_X)[0][1]
 
-        # 5. 萃取特徵重要性 (Feature Importance) - 這就是我們要的因子貢獻度
         importances = rf.feature_importances_
         feature_imp_map = dict(zip(valid_features, importances))
 
-        # 6. 將指標分類為業務領域的因子
         trend_weight = feature_imp_map.get("SMA_20", 0) + feature_imp_map.get("MACD_12_26_9", 0)
         momentum_weight = feature_imp_map.get("RSI_14", 0)
         volatility_weight = feature_imp_map.get("volatility_20", 0)
         
-        # 避免全為 0 的情況
         total_weight = trend_weight + momentum_weight + volatility_weight
         if total_weight == 0: total_weight = 1
 
@@ -283,7 +273,6 @@ def calculate_robustness(df: pd.DataFrame) -> dict:
         if "strategy_ret" not in df.columns:
             return {}
         
-        # 1. 市場體制測試 (Market Regime) - 用 SMA200 切分牛熊
         df['SMA_200'] = df['Close'].rolling(window=200).mean()
         df['Regime'] = np.where(df['Close'] > df['SMA_200'], 'Bull', 'Bear')
         
@@ -297,12 +286,8 @@ def calculate_robustness(df: pd.DataFrame) -> dict:
         bull_win_rate, bull_cagr = calc_regime_metrics(df[df['Regime'] == 'Bull'])
         bear_win_rate, bear_cagr = calc_regime_metrics(df[df['Regime'] == 'Bear'])
 
-        # ----------------------------------------------------
-        # 🚀 新增：計算樣本外報酬、過擬合風險、體制抗性評分
-        # ----------------------------------------------------
         valid_rets = df["strategy_ret"].dropna()
         
-        # A. 樣本外測試 (Out of Sample) - 取最近 60 個交易日 (約一季)
         if len(valid_rets) > 60:
             oos_rets = valid_rets.tail(60)
             is_rets = valid_rets.iloc[:-60]
@@ -312,19 +297,15 @@ def calculate_robustness(df: pd.DataFrame) -> dict:
             oos_return_pct = 0.0
             is_return_pct = 0.0
 
-        # B. 過擬合風險 (Overfit Risk) - 比較樣本內與樣本外表現
         if oos_return_pct < 0 and is_return_pct > 0:
-            overfit_risk = "高" # 訓練期賺錢，但最新一季賠錢
+            overfit_risk = "高"
         elif oos_return_pct >= 0 and oos_return_pct < (is_return_pct / max(1, (len(valid_rets)/60))):
-            overfit_risk = "中" # 賺比較少，稍微衰退
+            overfit_risk = "中"
         else:
-            overfit_risk = "低" # 樣本外表現依然強勁
+            overfit_risk = "低"
 
-        # C. 體制抗性評分 (Resilience Score 0-100) - 熊市勝率越高，抗性越強
-        # 假設熊市勝率達到 50% 就算滿分 100
         resilience_score = min(100, max(0, int((bear_win_rate / 50) * 100))) if pd.notna(bear_win_rate) else 50
 
-        # 2. 滾動窗口測試 (Rolling Window) - 按「季」計算勝率
         df_temp = df.copy()
         df_temp['Quarter'] = df_temp.index.to_period('Q').astype(str)
         df_temp['Quarter_Str'] = df_temp['Quarter'].apply(lambda x: f"{x[2:4]}Q{x[-1]}")
@@ -337,7 +318,7 @@ def calculate_robustness(df: pd.DataFrame) -> dict:
                 "winRate": round(q_win_rate, 1) if pd.notna(q_win_rate) else 0
             })
         
-        rolling_data = rolling_data[-12:] # 取最近 12 季
+        rolling_data = rolling_data[-12:]
 
         return {
             "bull_win_rate": bull_win_rate,
@@ -345,7 +326,6 @@ def calculate_robustness(df: pd.DataFrame) -> dict:
             "bear_win_rate": bear_win_rate,
             "bear_cagr": bear_cagr,
             "rolling_data": rolling_data,
-            # 👇 更新回傳值
             "out_of_sample_return_pct": oos_return_pct,
             "overfit_risk": overfit_risk,
             "regime_resilience_score": resilience_score
@@ -365,44 +345,39 @@ def calculate_drawdown(returns: pd.Series) -> float:
     return abs(drawdown.min()) * 100
 
 def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
-    # 策略核心：MACD 柱狀圖大於 0 且 收盤價站在 60 日均線之上
+    # ✅ 修正：確保欄位名稱正確，MACDh_12_26_9 是柱狀圖
+    if "MACDh_12_26_9" not in df.columns or "EMA_60" not in df.columns:
+        return {}
+
     df["signal"] = np.where((df["MACDh_12_26_9"] > 0) & (df["Close"] > df["EMA_60"]), 1, 0)
     df["strategy_ret"] = df["signal"].shift(1) * df["ret"]
     
     valid_rets = df["strategy_ret"].dropna()
-    cum_ret = (1 + valid_rets).cumprod().iloc[-1] - 1 if not valid_rets.empty else 0
+    if valid_rets.empty: return {}
+
+    cum_ret = (1 + valid_rets).cumprod().iloc[-1] - 1
     bh_ret = (1 + df["ret"].dropna()).cumprod().iloc[-1] - 1 
     
     mdd = calculate_drawdown(valid_rets)
     sharpe = (valid_rets.mean() / valid_rets.std()) * np.sqrt(252) if valid_rets.std() > 0 else 0
     
-    # ==========================================
-    # 🚀 新增：進階量化指標 (Quant Metrics)
-    # ==========================================
-    
-    # 1. CAGR / 年化報酬率 (假設一年 252 個交易日)
     trading_days = len(valid_rets)
     years = trading_days / 252
     cagr = ((1 + cum_ret) ** (1 / years) - 1) if years > 0 else 0
     
-    # 2. Sortino Ratio (索提諾比率：只懲罰下行風險)
     downside_rets = valid_rets[valid_rets < 0]
     downside_std = downside_rets.std() * np.sqrt(252)
     annualized_ret = valid_rets.mean() * 252
     sortino = (annualized_ret / downside_std) if downside_std > 0 else 0
     
-    # 3. Calmar Ratio (卡瑪比率：年化報酬 / 最大回撤)
-    mdd_decimal = mdd / 100 # 將前面算出的 % 換算回小數
+    mdd_decimal = mdd / 100
     calmar = (cagr / mdd_decimal) if mdd_decimal > 0 else 0
     
-    # 4. Walk-forward test (簡易步進測試：計算每年的獨立績效)
     df["year"] = df.index.year
     yearly_rets = df.groupby("year")["strategy_ret"].apply(
         lambda x: (1 + x).cumprod().iloc[-1] - 1 if len(x) > 0 else 0
     )
     walk_forward_metrics = {str(int(year)): round(ret * 100, 2) for year, ret in yearly_rets.items()}
-    
-    # ==========================================
     
     win_days = len(valid_rets[valid_rets > 0])
     total_trades = len(valid_rets[valid_rets != 0])
@@ -411,28 +386,26 @@ def run_backtest(df: pd.DataFrame) -> Dict[str, Any]:
     return {
         "cumulative_return_pct": round(cum_ret * 100, 2),
         "buy_and_hold_return_pct": round(bh_ret * 100, 2),
-        "cagr_pct": round(cagr * 100, 2),            # ✅ 新增：年化報酬
+        "cagr_pct": round(cagr * 100, 2),
         "max_drawdown_pct": round(mdd, 2),
         "sharpe_ratio": round(sharpe, 2),
-        "sortino_ratio": round(sortino, 2),          # ✅ 新增：索提諾比率
-        "calmar_ratio": round(calmar, 2),            # ✅ 新增：卡瑪比率
+        "sortino_ratio": round(sortino, 2),
+        "calmar_ratio": round(calmar, 2),
         "win_rate_pct": round(win_rate, 2),
-        "walk_forward_yearly_pct": walk_forward_metrics # ✅ 新增：步進測試(逐年績效)
+        "walk_forward_yearly_pct": walk_forward_metrics
     }
 
 # ==========================
 # 🚀 API 路由區
 # ==========================
 
-# 1️⃣ 分析與大盤比較 API 
 @app.post("/api/analyze")
 async def analyze(request: AnalysisRequest):
     symbol = request.symbol.strip().upper()
-    interval = request.interval # ✅ 新增：取得要求的時間框架
+    interval = request.interval
     df = await fetch_price_history(symbol, interval)
     if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料或資料不足")
 
-    # ✅ 更新：改為使用 fetch_google_news
     is_tw = is_taiwan_stock(symbol)
     clean_sym = clean_tw_symbol(symbol) if is_tw else symbol
     news_data = await fetch_google_news(clean_sym, is_tw=is_tw)
@@ -455,14 +428,12 @@ async def analyze(request: AnalysisRequest):
     recent_rets = df["ret"].tail(120).dropna()
     cvar_95 = recent_rets[recent_rets <= recent_rets.quantile(0.05)].mean()
     
-    # --- 準備圖表資料 ---
-    # 🚨 修正 3：將回傳給前端的資料增加到 300 筆，讓 K 線圖不再空蕩蕩
     hist_df = df.tail(300).reset_index() 
     history_data = []
     for _, row in hist_df.iterrows():
         history_data.append({
             "date": row["date"].strftime("%Y-%m-%d"),
-            "price": round(row["Close"], 2), # 保留舊版相容性
+            "price": round(row["Close"], 2),
             "open": round(row["Open"], 2),
             "high": round(row["High"], 2),
             "low": round(row["Low"], 2),
@@ -478,10 +449,9 @@ async def analyze(request: AnalysisRequest):
     prediction_data = []
     current_sim_price = last_price
     
-    # 產生 15 期的預測漫步
     for i in range(1, 16):
         sim_date = last_date + datetime.timedelta(days=i * (7 if interval == '1wk' else (30 if interval == '1mo' else 1)))
-        if interval == '1d' and sim_date.weekday() >= 5: # 如果是日線跳過六日
+        if interval == '1d' and sim_date.weekday() >= 5:
             continue
             
         drift = recent_rets.mean() if not pd.isna(recent_rets.mean()) else 0
@@ -492,14 +462,10 @@ async def analyze(request: AnalysisRequest):
             "mid": round(current_sim_price, 2)
         })
 
-    # --- 準備評分與機器學習資料 ---
     current_rsi = float(df["RSI_14"].iloc[-1]) if "RSI_14" in df.columns else 50
     tech_score = int(current_rsi)
-    
-    # 🚀 這裡呼叫我們剛寫好的隨機森林模型
     ml_analysis = calculate_ml_factor_contributions(df)
     
-    # 如果有真實的 ML 預測數據，用它當作總分；如果沒有，就用 RSI 基礎分數代替
     if ml_analysis:
         ai_total_score = int(ml_analysis["upward_probability_pct"])
         ml_prediction_data = {
@@ -515,7 +481,7 @@ async def analyze(request: AnalysisRequest):
         "market_benchmark": "0050(台灣50)" if is_tw else "SPY(標普500)",
         "ai_score": ai_total_score,
         "ai_sentiment": "偏多震盪" if ai_total_score > 50 else "弱勢整理",
-        "ml_prediction": ml_prediction_data,  # 👈 這裡如果是 None，前端就會自動隱藏面板
+        "ml_prediction": ml_prediction_data,
         "quant_metrics": {
             "beta": round(beta, 2),          
             "annual_alpha_pct": round(alpha, 2), 
@@ -540,24 +506,20 @@ async def analyze(request: AnalysisRequest):
         "news": news_data
     }
 
-# 2️⃣ 回測 API
 @app.get("/api/backtest/{symbol}")
 async def backtest_endpoint(symbol: str):
     df = await fetch_price_history(symbol.upper())
     if df.empty: raise HTTPException(status_code=404, detail="找不到股票資料")
     
     bt_result = run_backtest(df)
-    
-    # 🚀 新增：計算穩健性，並將結果回傳！
     robustness_result = calculate_robustness(df)
     
     return {
         "symbol": symbol.upper(), 
         "backtest_3yr": bt_result,
-        "robustness": robustness_result # ✅ 新增：放入 robustness 提供前端讀取
+        "robustness": robustness_result
     }
 
-# 3️⃣ 投資組合管理 API
 @app.post("/api/portfolio")
 async def add_portfolio(item: PortfolioItem):
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -618,7 +580,6 @@ async def get_portfolio(username: str):
         "positions": positions
     }
 
-# 4️⃣ 新聞 API (✅ 更新：改用 Google News 並清理股票代碼)
 @app.get("/api/news/{symbol}")
 async def get_news(symbol: str):
     is_tw = is_taiwan_stock(symbol)
@@ -626,7 +587,6 @@ async def get_news(symbol: str):
     news = await fetch_google_news(clean_sym, is_tw=is_tw)
     return {"symbol": symbol.upper(), "news": news}
 
-# 5️⃣ 新增：讓使用者自訂關鍵字搜尋新聞 API
 @app.get("/api/news/search/")
 async def search_custom_news(
     q: str = Query(..., description="使用者輸入的搜尋關鍵字"), 
